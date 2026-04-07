@@ -6,6 +6,9 @@ Read-only Kibana/ES CLI for AI agents. Queries Elasticsearch through Kibana's co
 
 ```bash
 uv tool install kibana-agent
+
+# or just run:
+# uvx kibana-agent
 ```
 
 ## Setup
@@ -21,11 +24,11 @@ Auth: `1password` (Touch ID, cached 30 min), `keychain` (macOS), `plain`.
 
 ```bash
 kibana-agent context                                            # index overview
-kibana-agent search my-index-* --last 1h -n 10                 # search logs
-kibana-agent count my-index-* -q '{"match":{"level":"ERROR"}}'   # count docs
-kibana-agent tail my-index-* -f @timestamp,level,message        # live stream
-kibana-agent histogram my-index-* --last 6h --interval 10m     # date histogram
-kibana-agent discover my-index-* --kql "level:ERROR"            # Kibana URL
+kibana-agent search 'my-index-*' --last 1h -n 10                 # search logs
+kibana-agent count 'my-index-*' -q '{"match":{"level":"ERROR"}}'   # count docs
+kibana-agent tail 'my-index-*' -f @timestamp,level,message        # live stream
+kibana-agent histogram 'my-index-*' --last 6h --interval 10m     # date histogram
+kibana-agent discover 'my-index-*' --kql "level:ERROR"            # Kibana URL
 ```
 
 ## Agent setup

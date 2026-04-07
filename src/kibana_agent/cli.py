@@ -35,6 +35,7 @@ Cache:   ~/.cache/kibana-agent/
 
 from __future__ import annotations
 
+import contextlib
 import fnmatch
 import hashlib
 import json
@@ -44,16 +45,13 @@ import signal
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlencode
 
 import click
 import requests
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Constants
-# ═══════════════════════════════════════════════════════════════════════════
 
 CONFIG_DIR = Path.home() / ".config" / "kibana-agent"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -70,246 +68,11 @@ CACHE_TTL_ALIASES = 3600
 CACHE_TTL_MAPPING = 86400
 CACHE_TTL_CONTEXT = 3600
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Profile / config persistence
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def _load_config() -> dict:
-    if CONFIG_FILE.exists():
-        try:
-            return json.loads(CONFIG_FILE.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {"active": None, "profiles": {}}
-
-
-def _save_config(cfg: dict) -> None:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
-
-
-def _get_profile(name: str | None = None) -> dict:
-    """Return the resolved profile dict or exit with error."""
-    cfg = _load_config()
-    pname = name or cfg.get("active")
-    if not pname:
-        click.echo("No active profile. Run: profile create <name> ...", err=True)
-        sys.exit(1)
-    p = cfg.get("profiles", {}).get(pname)
-    if not p:
-        click.echo(f"Profile '{pname}' not found. Run: profile list", err=True)
-        sys.exit(1)
-    return p
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# macOS Keychain helpers
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def _keychain_read(service: str, account: str) -> str | None:
-    try:
-        return subprocess.run(
-            ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
-            capture_output=True, text=True, check=True,
-        ).stdout.strip()
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return None
-
-
-def _keychain_write(service: str, account: str, value: str) -> None:
-    subprocess.run(
-        ["security", "delete-generic-password", "-s", service, "-a", account],
-        capture_output=True,
-    )
-    subprocess.run(
-        ["security", "add-generic-password", "-s", service, "-a", account, "-w", value],
-        capture_output=True, text=True, check=True,
-    )
-
-
-def _keychain_delete(service: str, account: str) -> None:
-    subprocess.run(
-        ["security", "delete-generic-password", "-s", service, "-a", account],
-        capture_output=True,
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Credential cache — caches 1Password/Keychain creds in macOS Keychain
-# so Touch ID is only needed once per TTL window.
-# ═══════════════════════════════════════════════════════════════════════════
-
 _CRED_CACHE_SERVICE = "kibana-agent"
 _CRED_CACHE_TTL = 30 * 60  # 30 minutes
 _CRED_CACHE_KEYS = ("cache-username", "cache-password", "cache-ts")
 
-
-def _cached_creds_get() -> tuple[str, str] | None:
-    ts = _keychain_read(_CRED_CACHE_SERVICE, "cache-ts")
-    if not ts:
-        return None
-    try:
-        if time.time() - float(ts) > _CRED_CACHE_TTL:
-            return None
-    except ValueError:
-        return None
-    u = _keychain_read(_CRED_CACHE_SERVICE, "cache-username")
-    p = _keychain_read(_CRED_CACHE_SERVICE, "cache-password")
-    return (u, p) if u and p else None
-
-
-def _cached_creds_put(u: str, p: str) -> None:
-    _keychain_write(_CRED_CACHE_SERVICE, "cache-username", u)
-    _keychain_write(_CRED_CACHE_SERVICE, "cache-password", p)
-    _keychain_write(_CRED_CACHE_SERVICE, "cache-ts", str(time.time()))
-
-
-def _cached_creds_clear() -> None:
-    for key in _CRED_CACHE_KEYS:
-        _keychain_delete(_CRED_CACHE_SERVICE, key)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Auth backends
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def _auth_1password(auth: dict) -> tuple[str, str]:
-    def op_read(ref: str) -> str:
-        cmd = ["op", "read", ref]
-        session = os.environ.get("OP_SESSION")
-        if session:
-            cmd += ["--session", session]
-        try:
-            return subprocess.run(
-                cmd, capture_output=True, text=True, check=True,
-            ).stdout.strip()
-        except FileNotFoundError:
-            click.echo("Error: `op` CLI not found.", err=True)
-            sys.exit(1)
-        except subprocess.CalledProcessError as e:
-            click.echo(f"op error: {e.stderr.strip()}", err=True)
-            if "promptError" in (e.stderr or ""):
-                click.echo(
-                    "Hint: run this command in a terminal that can show Touch ID.\n"
-                    "Credentials will be cached in macOS Keychain for 30 min.",
-                    err=True,
-                )
-            sys.exit(1)
-
-    return op_read(auth["username_ref"]), op_read(auth["password_ref"])
-
-
-def _auth_keychain(auth: dict) -> tuple[str, str]:
-    service = auth["service"]
-    u = _keychain_read(service, auth["username_account"])
-    p = _keychain_read(service, auth["password_account"])
-    if u is None or p is None:
-        missing = "username" if u is None else "password"
-        click.echo(f"Keychain: {missing} not found for service='{service}'", err=True)
-        sys.exit(1)
-    return u, p
-
-
-def _auth_plain(auth: dict) -> tuple[str, str]:
-    return auth["username"], auth["password"]
-
-
-_AUTH_BACKENDS = {
-    "1password": _auth_1password,
-    "keychain": _auth_keychain,
-    "plain": _auth_plain,
-}
-
-_creds_cache: tuple[str, str] | None = None
-
-
-def creds(profile: dict) -> tuple[str, str]:
-    global _creds_cache
-    if _creds_cache is not None:
-        return _creds_cache
-
-    auth = profile["auth"]
-    auth_type = auth["type"]
-
-    # Try Keychain cache first (avoids Touch ID)
-    if auth_type in ("1password", "keychain"):
-        cached = _cached_creds_get()
-        if cached:
-            _creds_cache = cached
-            return cached
-
-    backend = _AUTH_BACKENDS.get(auth_type)
-    if not backend:
-        click.echo(f"Unknown auth type: {auth_type}", err=True)
-        sys.exit(1)
-
-    u, p = backend(auth)
-    _creds_cache = (u, p)
-
-    # Cache in Keychain so subsequent CLI invocations skip Touch ID
-    if auth_type in ("1password", "keychain"):
-        _cached_creds_put(u, p)
-
-    return u, p
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Cache
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def _cache_path(name: str) -> Path:
-    cfg = _load_config()
-    pname = cfg.get("active", "_default")
-    pdir = CACHE_DIR / re.sub(r"[^\w\-.]", "_", pname)
-    pdir.mkdir(parents=True, exist_ok=True)
-    safe = re.sub(r"[^\w.-]", "_", name)
-    return pdir / f"{safe}.json"
-
-
-def cache_get(name: str, ttl: int) -> object | None:
-    p = _cache_path(name)
-    if not p.exists():
-        return None
-    try:
-        d = json.loads(p.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None
-    if time.time() - d.get("_t", 0) > ttl:
-        return None
-    return d.get("_p")
-
-
-def cache_put(name: str, payload: object) -> None:
-    p = _cache_path(name)
-    p.write_text(json.dumps({"_t": time.time(), "_p": payload}, ensure_ascii=False))
-
-
-def cache_clear_all() -> int:
-    if not CACHE_DIR.exists():
-        return 0
-    n = 0
-    for p in CACHE_DIR.rglob("*.json"):
-        p.unlink()
-        n += 1
-    # Remove empty dirs
-    for d in sorted(CACHE_DIR.rglob("*"), reverse=True):
-        if d.is_dir():
-            try:
-                d.rmdir()
-            except OSError:
-                pass
-    return n
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Read-only guard
-# ═══════════════════════════════════════════════════════════════════════════
-
-BLOCKED = {
+BLOCKED_ENDPOINTS = {
     "_bulk",
     "_create",
     "_delete_by_query",
@@ -326,7 +89,7 @@ BLOCKED = {
     "_snapshot",
     "_restore",
 }
-POST_OK = (
+ALLOWED_POST_ENDPOINTS = (
     "_search",
     "_msearch",
     "_count",
@@ -341,35 +104,246 @@ POST_OK = (
     "_render/template",
 )
 
+_AUTH_BACKENDS: dict[str, Any] = {}
+_creds_cache: tuple[str, str] | None = None
+
+
+def _load_config() -> dict[str, Any]:
+    if CONFIG_FILE.exists():
+        try:
+            return json.loads(CONFIG_FILE.read_text())  # type: ignore[no-any-return]
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {"active": None, "profiles": {}}
+
+
+def _save_config(config: dict[str, Any]) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n")
+
+
+def _get_profile(name: str | None = None) -> dict[str, Any]:
+    """Return the resolved profile dict or exit with error."""
+    config = _load_config()
+    profile_name = name or config.get("active")
+    if not profile_name:
+        click.echo("No active profile. Run: profile create <name> ...", err=True)
+        sys.exit(1)
+    profile_data = config.get("profiles", {}).get(profile_name)
+    if not profile_data:
+        click.echo(f"Profile '{profile_name}' not found. Run: profile list", err=True)
+        sys.exit(1)
+    return profile_data  # type: ignore[no-any-return]
+
+
+def _keychain_read(service: str, account: str) -> str | None:
+    try:
+        return subprocess.run(
+            ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
+
+
+def _keychain_write(service: str, account: str, value: str) -> None:
+    subprocess.run(
+        ["security", "delete-generic-password", "-s", service, "-a", account],
+        capture_output=True,
+    )
+    subprocess.run(
+        ["security", "add-generic-password", "-s", service, "-a", account, "-w", value],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+
+def _keychain_delete(service: str, account: str) -> None:
+    subprocess.run(
+        ["security", "delete-generic-password", "-s", service, "-a", account],
+        capture_output=True,
+    )
+
+
+def _cached_creds_get() -> tuple[str, str] | None:
+    """Read cached credentials from macOS Keychain if still within TTL."""
+    timestamp = _keychain_read(_CRED_CACHE_SERVICE, "cache-ts")
+    if not timestamp:
+        return None
+    try:
+        if time.time() - float(timestamp) > _CRED_CACHE_TTL:
+            return None
+    except ValueError:
+        return None
+    username = _keychain_read(_CRED_CACHE_SERVICE, "cache-username")
+    password = _keychain_read(_CRED_CACHE_SERVICE, "cache-password")
+    return (username, password) if username and password else None
+
+
+def _cached_creds_put(username: str, password: str) -> None:
+    _keychain_write(_CRED_CACHE_SERVICE, "cache-username", username)
+    _keychain_write(_CRED_CACHE_SERVICE, "cache-password", password)
+    _keychain_write(_CRED_CACHE_SERVICE, "cache-ts", str(time.time()))
+
+
+def _cached_creds_clear() -> None:
+    for key in _CRED_CACHE_KEYS:
+        _keychain_delete(_CRED_CACHE_SERVICE, key)
+
+
+def _auth_1password(auth: dict[str, Any]) -> tuple[str, str]:
+    def op_read(ref: str) -> str:
+        cmd = ["op", "read", ref]
+        session = os.environ.get("OP_SESSION")
+        if session:
+            cmd += ["--session", session]
+        try:
+            return subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+        except FileNotFoundError:
+            click.echo("Error: `op` CLI not found.", err=True)
+            sys.exit(1)
+        except subprocess.CalledProcessError as exc:
+            click.echo(f"op error: {exc.stderr.strip()}", err=True)
+            if "promptError" in (exc.stderr or ""):
+                click.echo(
+                    "Hint: run this command in a terminal that can show Touch ID.\n"
+                    "Credentials will be cached in macOS Keychain for 30 min.",
+                    err=True,
+                )
+            sys.exit(1)
+
+    return op_read(auth["username_ref"]), op_read(auth["password_ref"])
+
+
+def _auth_keychain(auth: dict[str, Any]) -> tuple[str, str]:
+    service = auth["service"]
+    username = _keychain_read(service, auth["username_account"])
+    password = _keychain_read(service, auth["password_account"])
+    if username is None or password is None:
+        missing = "username" if username is None else "password"
+        click.echo(f"Keychain: {missing} not found for service='{service}'", err=True)
+        sys.exit(1)
+    return username, password
+
+
+def _auth_plain(auth: dict[str, Any]) -> tuple[str, str]:
+    return auth["username"], auth["password"]
+
+
+_AUTH_BACKENDS = {
+    "1password": _auth_1password,
+    "keychain": _auth_keychain,
+    "plain": _auth_plain,
+}
+
+
+def creds(profile: dict[str, Any]) -> tuple[str, str]:
+    global _creds_cache
+    if _creds_cache is not None:
+        return _creds_cache
+
+    auth = profile["auth"]
+    auth_type = auth["type"]
+
+    if auth_type in ("1password", "keychain"):
+        cached = _cached_creds_get()
+        if cached:
+            _creds_cache = cached
+            return cached
+
+    backend = _AUTH_BACKENDS.get(auth_type)
+    if not backend:
+        click.echo(f"Unknown auth type: {auth_type}", err=True)
+        sys.exit(1)
+
+    username, password = backend(auth)
+    _creds_cache = (username, password)
+
+    if auth_type in ("1password", "keychain"):
+        _cached_creds_put(username, password)
+
+    return username, password
+
+
+def _cache_path(name: str) -> Path:
+    config = _load_config()
+    profile_name = config.get("active", "_default")
+    profile_dir = CACHE_DIR / re.sub(r"[^\w\-.]", "_", profile_name)
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = re.sub(r"[^\w.-]", "_", name)
+    return profile_dir / f"{safe_name}.json"
+
+
+def cache_get(name: str, ttl: int) -> Any | None:
+    path = _cache_path(name)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    if time.time() - data.get("_t", 0) > ttl:
+        return None
+    return data.get("_p")
+
+
+def cache_put(name: str, payload: Any) -> None:
+    path = _cache_path(name)
+    path.write_text(json.dumps({"_t": time.time(), "_p": payload}, ensure_ascii=False))
+
+
+def cache_clear_all() -> int:
+    if not CACHE_DIR.exists():
+        return 0
+    count = 0
+    for path in CACHE_DIR.rglob("*.json"):
+        path.unlink()
+        count += 1
+    for directory in sorted(CACHE_DIR.rglob("*"), reverse=True):
+        if directory.is_dir():
+            with contextlib.suppress(OSError):
+                directory.rmdir()
+    return count
+
 
 def _guard(method: str, path: str) -> None:
     if method not in ("GET", "POST"):
         click.echo(f"Blocked: {method}", err=True)
         sys.exit(1)
-    lp = path.lower()
-    for s in BLOCKED:
-        if s in lp:
-            click.echo(f"Blocked: {s}", err=True)
+    lower_path = path.lower()
+    for segment in BLOCKED_ENDPOINTS:
+        if segment in lower_path:
+            click.echo(f"Blocked: {segment}", err=True)
             sys.exit(1)
-    if method == "POST" and not any(lp.endswith(s) for s in POST_OK):
+    if method == "POST" and not any(lower_path.endswith(ep) for ep in ALLOWED_POST_ENDPOINTS):
         click.echo(f"Blocked: POST {path}", err=True)
         sys.exit(1)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# HTTP
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def _curl(
-    url: str, method: str, path: str, body: dict | None, timeout: int, fp: str | None
+def _build_curl(
+    url: str,
+    method: str,
+    path: str,
+    body: dict[str, Any] | None,
+    timeout: int,
+    filter_path: str | None,
 ) -> str:
-    ap = path + (("&" if "?" in path else "?") + f"filter_path={fp}" if fp else "")
-    full = f"{url}/api/console/proxy?{urlencode({'path': ap, 'method': method})}"
+    actual_path = path + (
+        ("&" if "?" in path else "?") + f"filter_path={filter_path}" if filter_path else ""
+    )
+    full_url = f"{url}/api/console/proxy?{urlencode({'path': actual_path, 'method': method})}"
     parts = [
         "curl -s",
         '-u "$USER:$PASS"',
-        f'-X POST "{full}"',
+        f'-X POST "{full_url}"',
         '-H "kbn-xsrf: true" -H "Content-Type: application/json"',
         f"--max-time {timeout}",
     ]
@@ -379,107 +353,107 @@ def _curl(
 
 
 def es(
-    profile: dict,
+    profile: dict[str, Any],
     method: str,
     path: str,
-    body: dict | None = None,
+    body: dict[str, Any] | None = None,
     *,
     timeout: int = DEFAULT_TIMEOUT,
     dry_run: bool = False,
     explain: bool = False,
-    fp: str | None = None,
-) -> dict | list:
+    filter_path: str | None = None,
+) -> dict[str, Any] | list[Any]:
     method = method.upper()
     _guard(method, path)
     if explain and body:
-        click.echo(
-            json.dumps(body, ensure_ascii=False, separators=(",", ":")), err=True
-        )
+        click.echo(json.dumps(body, ensure_ascii=False, separators=(",", ":")), err=True)
     url = profile["kibana_url"].rstrip("/")
     if dry_run:
-        click.echo(_curl(url, method, path, body, timeout, fp))
+        click.echo(_build_curl(url, method, path, body, timeout, filter_path))
         sys.exit(0)
 
-    u, p = creds(profile)
-    ap = path + (("&" if "?" in path else "?") + f"filter_path={fp}" if fp else "")
-    r = requests.post(
+    username, password = creds(profile)
+    actual_path = path + (
+        ("&" if "?" in path else "?") + f"filter_path={filter_path}" if filter_path else ""
+    )
+    response = requests.post(
         f"{url}/api/console/proxy",
-        params={"path": ap, "method": method},
+        params={"path": actual_path, "method": method},
         headers={"kbn-xsrf": "true", "Content-Type": "application/json"},
         json=body,
-        auth=(u, p),
+        auth=(username, password),
         timeout=timeout,
     )
-    if r.status_code >= 400:
-        click.echo(f"ES {r.status_code}: {r.text[:300]}", err=True)
+    if response.status_code >= 400:
+        click.echo(f"ES {response.status_code}: {response.text[:300]}", err=True)
         sys.exit(1)
-    if len(r.content) > MAX_RESPONSE_BYTES:
-        click.echo(f"Warning: {len(r.content):,}B response", err=True)
-    return r.json()
+    if len(response.content) > MAX_RESPONSE_BYTES:
+        click.echo(f"Warning: {len(response.content):,}B response", err=True)
+    return response.json()  # type: ignore[no-any-return]
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Formatting
-# ═══════════════════════════════════════════════════════════════════════════
+def _strip_empty(data: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in data.items() if v is not None and v != "" and v != [] and v != {}}
 
 
-def _strip(d: dict) -> dict:
-    return {
-        k: v for k, v in d.items() if v is not None and v != "" and v != [] and v != {}
-    }
-
-
-def _hit(h: dict, fl: list[str] | None) -> dict:
-    src = h.get("_source", {})
-    if fl:
-        src = {k: src[k] for k in fl if k in src}
-    out = _strip(src)
-    if h.get("sort"):
-        out["_sort"] = h["sort"]
+def _format_hit(hit: dict[str, Any], field_list: list[str] | None) -> dict[str, Any]:
+    source = hit.get("_source", {})
+    if field_list:
+        source = {k: source[k] for k in field_list if k in source}
+    out = _strip_empty(source)
+    if hit.get("sort"):
+        out["_sort"] = hit["sort"]
     return out
 
 
-def _search_result(data: dict, fl: list[str] | None, msl: int) -> dict:
+def _format_search_result(
+    data: dict[str, Any], field_list: list[str] | None, max_source_len: int
+) -> dict[str, Any]:
     total = data.get("hits", {}).get("total", {})
     if isinstance(total, dict):
         total = total.get("value", "?")
-    raw = data.get("hits", {}).get("hits", [])
-    trunc = len(raw) > MAX_RESPONSE_HITS
-    sl = raw[:MAX_RESPONSE_HITS] if trunc else raw
+    raw_hits = data.get("hits", {}).get("hits", [])
+    truncated = len(raw_hits) > MAX_RESPONSE_HITS
+    limited_hits = raw_hits[:MAX_RESPONSE_HITS] if truncated else raw_hits
     hits = []
-    for h in sl:
-        ch = _hit(h, fl)
-        s = json.dumps(ch, ensure_ascii=False, separators=(",", ":"))
-        hits.append({"_truncated": s[:msl] + "…"} if msl and len(s) > msl else ch)
-    r: dict = {"total": total, "n": len(hits)}
-    if trunc:
-        r["truncated"] = len(raw)
-    r["hits"] = hits
-    if "aggregations" in data:
-        r["aggs"] = data["aggregations"]
-    return r
-
-
-def _flat_props(props: dict, pre: str = "") -> dict[str, str]:
-    out: dict[str, str] = {}
-    for k, v in props.items():
-        full = f"{pre}.{k}" if pre else k
-        if "properties" in v:
-            out.update(_flat_props(v["properties"], full))
+    for hit in limited_hits:
+        formatted = _format_hit(hit, field_list)
+        serialized = json.dumps(formatted, ensure_ascii=False, separators=(",", ":"))
+        if max_source_len and len(serialized) > max_source_len:
+            hits.append({"_truncated": serialized[:max_source_len] + "…"})
         else:
-            out[full] = v.get("type", "object")
+            hits.append(formatted)
+    result: dict[str, Any] = {"total": total, "n": len(hits)}
+    if truncated:
+        result["truncated"] = len(raw_hits)
+    result["hits"] = hits
+    if "aggregations" in data:
+        result["aggs"] = data["aggregations"]
+    return result
+
+
+def _flatten_properties(properties: dict[str, Any], prefix: str = "") -> dict[str, str]:
+    out: dict[str, str] = {}
+    for key, value in properties.items():
+        full_key = f"{prefix}.{key}" if prefix else key
+        if "properties" in value:
+            out.update(_flatten_properties(value["properties"], full_key))
+        else:
+            out[full_key] = value.get("type", "object")
     return out
 
 
-def _mapping(data: dict) -> dict:
-    per: dict[str, dict[str, str]] = {}
-    for idx, m in data.items():
-        per[idx] = _flat_props(m.get("mappings", {}).get("properties", {}))
+def _parse_mapping(data: dict[str, Any]) -> dict[str, Any]:
+    per_index: dict[str, dict[str, str]] = {}
+    for index_name, mapping in data.items():
+        per_index[index_name] = _flatten_properties(
+            mapping.get("mappings", {}).get("properties", {})
+        )
     groups: dict[str, tuple[list[str], dict[str, str]]] = {}
-    for idx, fields in per.items():
-        fp = hashlib.md5(json.dumps(fields, sort_keys=True).encode()).hexdigest()[:8]
-        groups.setdefault(fp, ([], fields))[0].append(idx)
-    result: dict = {}
+    for index_name, fields in per_index.items():
+        fingerprint = hashlib.md5(json.dumps(fields, sort_keys=True).encode()).hexdigest()[:8]
+        groups.setdefault(fingerprint, ([], fields))[0].append(index_name)
+    result: dict[str, Any] = {}
     for _, (indices, fields) in groups.items():
         key = (
             indices[0]
@@ -490,78 +464,71 @@ def _mapping(data: dict) -> dict:
     return result
 
 
-def _aliases(data: dict) -> dict[str, list[str]]:
-    am: dict[str, list[str]] = {}
-    for idx, m in data.items():
-        if idx.startswith("."):
+def _parse_aliases(data: dict[str, Any]) -> dict[str, list[str]]:
+    alias_map: dict[str, list[str]] = {}
+    for index_name, mapping in data.items():
+        if index_name.startswith("."):
             continue
-        for a in m.get("aliases", {}):
-            am.setdefault(a, []).append(idx)
-    for a, idxs in am.items():
-        if len(idxs) > 5:
-            am[a] = [f"{os.path.commonprefix(idxs)}* ({len(idxs)})"]
-    return am
+        for alias in mapping.get("aliases", {}):
+            alias_map.setdefault(alias, []).append(index_name)
+    for alias, indices in alias_map.items():
+        if len(indices) > 5:
+            alias_map[alias] = [f"{os.path.commonprefix(indices)}* ({len(indices)})"]
+    return alias_map
 
 
-def _prefixes(raw: dict) -> list[str]:
-    pxs: set[str] = set()
-    for idx in raw:
-        if idx.startswith("."):
+def _extract_prefixes(raw: dict[str, Any]) -> list[str]:
+    prefixes: set[str] = set()
+    for index_name in raw:
+        if index_name.startswith("."):
             continue
-        parts = re.split(r"-\d{4}[.\-]", idx)
-        pxs.add(parts[0] + "-*" if len(parts) > 1 else idx)
-    return sorted(pxs)
+        parts = re.split(r"-\d{4}[.\-]", index_name)
+        prefixes.add(parts[0] + "-*" if len(parts) > 1 else index_name)
+    return sorted(prefixes)
 
 
-def emit(data: object, fmt: str) -> None:
+def emit(data: Any, fmt: str) -> None:
     if fmt == "compact" and isinstance(data, dict) and "hits" in data:
         meta = {k: v for k, v in data.items() if k != "hits"}
         if meta:
-            click.echo(
-                "#" + json.dumps(meta, ensure_ascii=False, separators=(",", ":"))
-            )
-        for h in data["hits"]:
-            click.echo(json.dumps(h, ensure_ascii=False, separators=(",", ":")))
+            click.echo("#" + json.dumps(meta, ensure_ascii=False, separators=(",", ":")))
+        for hit in data["hits"]:
+            click.echo(json.dumps(hit, ensure_ascii=False, separators=(",", ":")))
     elif fmt == "compact":
         click.echo(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
     else:
         click.echo(json.dumps(data, ensure_ascii=False, indent=2))
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Cached fetchers
-# ═══════════════════════════════════════════════════════════════════════════
+def fetch_aliases(
+    profile: dict[str, Any], *, no_cache: bool = False, **kwargs: Any
+) -> dict[str, list[str]]:
+    if not no_cache:
+        cached = cache_get("aliases", CACHE_TTL_ALIASES)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+    data = es(profile, "GET", "_aliases", **kwargs)
+    result = _parse_aliases(data)  # type: ignore[arg-type]
+    cache_put("aliases", result)
+    return result
 
 
-def fetch_aliases(prof: dict, *, nc: bool = False, **kw) -> dict:
-    if not nc:
-        c = cache_get("aliases", CACHE_TTL_ALIASES)
-        if c is not None:
-            return c
-    data = es(prof, "GET", "_aliases", **kw)
-    r = _aliases(data)
-    cache_put("aliases", r)
-    return r
-
-
-def fetch_mapping(prof: dict, idx: str, *, nc: bool = False, **kw) -> dict:
-    cn = f"mapping_{idx}"
-    if not nc:
-        c = cache_get(cn, CACHE_TTL_MAPPING)
-        if c is not None:
-            return c
-    data = es(prof, "GET", f"{idx}/_mapping", **kw)
-    r = _mapping(data)
-    cache_put(cn, r)
-    return r
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Rison encoder
-# ═══════════════════════════════════════════════════════════════════════════
+def fetch_mapping(
+    profile: dict[str, Any], index: str, *, no_cache: bool = False, **kwargs: Any
+) -> dict[str, Any]:
+    cache_name = f"mapping_{index}"
+    if not no_cache:
+        cached = cache_get(cache_name, CACHE_TTL_MAPPING)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+    data = es(profile, "GET", f"{index}/_mapping", **kwargs)
+    result = _parse_mapping(data)  # type: ignore[arg-type]
+    cache_put(cache_name, result)
+    return result
 
 
 def _rison(obj: object) -> str:
+    """Encode a Python object as a rison string (per https://github.com/nanonid/rison)."""
     if obj is True:
         return "!t"
     if obj is False:
@@ -571,22 +538,22 @@ def _rison(obj: object) -> str:
     if isinstance(obj, (int, float)):
         return str(obj)
     if isinstance(obj, str):
-        if re.match(r"^[a-zA-Z_~/.][-a-zA-Z0-9_~/.]*$", obj) and obj not in ("!t", "!f", "!n"):
+        if re.match(r"^[a-zA-Z_~/.][-a-zA-Z0-9_~/.]*$", obj) and obj not in (
+            "!t",
+            "!f",
+            "!n",
+        ):
             return obj
         return "'" + obj.replace("!", "!!").replace("'", "!'") + "'"
     if isinstance(obj, (list, tuple)):
-        return "!(" + ",".join(_rison(i) for i in obj) + ")"
+        return "!(" + ",".join(_rison(item) for item in obj) + ")"
     if isinstance(obj, dict):
         return "(" + ",".join(f"{_rison(k)}:{_rison(v)}" for k, v in obj.items()) + ")"
     return str(obj)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# CLI plumbing
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def common(f):
+def common(f: Any) -> Any:
+    """Decorator adding shared CLI options to a command."""
     f = click.option(
         "--profile",
         "prof_name",
@@ -597,46 +564,43 @@ def common(f):
     f = click.option("--timeout", type=int, default=DEFAULT_TIMEOUT)(f)
     f = click.option("--dry-run", is_flag=True, default=False)(f)
     f = click.option("--explain", is_flag=True, default=False)(f)
-    f = click.option("--filter-path", "fp", default=None)(f)
+    f = click.option("--filter-path", "filter_path", default=None)(f)
     f = click.option(
         "--format", "fmt", type=click.Choice(["pretty", "compact"]), default="compact"
     )(f)
-    f = click.option("--no-cache", "nc", is_flag=True, default=False)(f)
+    f = click.option("--no-cache", "no_cache", is_flag=True, default=False)(f)
     return f
 
 
-def _kw(timeout, dry_run, explain, fp) -> dict:
-    kw: dict = {"timeout": timeout}
+def _es_kwargs(
+    timeout: int, dry_run: bool, explain: bool, filter_path: str | None
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {"timeout": timeout}
     if dry_run:
-        kw["dry_run"] = True
+        kwargs["dry_run"] = True
     if explain:
-        kw["explain"] = True
-    if fp:
-        kw["fp"] = fp
-    return kw
+        kwargs["explain"] = True
+    if filter_path:
+        kwargs["filter_path"] = filter_path
+    return kwargs
 
 
-def _time_must(tr: str, field: str = "@timestamp") -> dict:
-    return {"range": {field: {"gte": f"now-{tr}"}}}
+def _time_range_filter(time_range: str, field: str = "@timestamp") -> dict[str, Any]:
+    return {"range": {field: {"gte": f"now-{time_range}"}}}
 
 
-def _fl(csv: str | None) -> list[str] | None:
+def _parse_fields(csv: str | None) -> list[str] | None:
     return [f.strip() for f in csv.split(",") if f.strip()] if csv else None
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# CLI: profile management
-# ═══════════════════════════════════════════════════════════════════════════
 
 
 @click.group()
 @click.version_option("0.1.0")
-def cli():
+def cli() -> None:
     """Read-only Kibana/ES CLI for AI agents."""
 
 
 @cli.group()
-def profile():
+def profile() -> None:
     """Manage connection profiles."""
 
 
@@ -650,44 +614,31 @@ def profile():
     type=click.Choice(["1password", "keychain", "plain"]),
     help="Auth backend",
 )
-# 1password options
 @click.option("--op-username", default=None, help="1Password ref for username")
 @click.option("--op-password", default=None, help="1Password ref for password")
-# keychain options
 @click.option("--kc-service", default=None, help="Keychain service name")
-@click.option(
-    "--kc-username-account", default=None, help="Keychain account for username"
-)
-@click.option(
-    "--kc-password-account", default=None, help="Keychain account for password"
-)
-@click.option(
-    "--kc-set-username", default=None, help="Store this username in Keychain now"
-)
-@click.option(
-    "--kc-set-password", default=None, help="Store this password in Keychain now"
-)
-# plain options
+@click.option("--kc-username-account", default=None, help="Keychain account for username")
+@click.option("--kc-password-account", default=None, help="Keychain account for password")
+@click.option("--kc-set-username", default=None, help="Store this username in Keychain now")
+@click.option("--kc-set-password", default=None, help="Store this password in Keychain now")
 @click.option("--username", default=None, help="Plain text username")
 @click.option("--password", default=None, help="Plain text password")
-@click.option(
-    "--use", "set_active", is_flag=True, default=False, help="Set as active profile"
-)
+@click.option("--use", "set_active", is_flag=True, default=False, help="Set as active profile")
 def profile_create(
-    name,
-    url,
-    auth_type,
-    op_username,
-    op_password,
-    kc_service,
-    kc_username_account,
-    kc_password_account,
-    kc_set_username,
-    kc_set_password,
-    username,
-    password,
-    set_active,
-):
+    name: str,
+    url: str,
+    auth_type: str,
+    op_username: str | None,
+    op_password: str | None,
+    kc_service: str | None,
+    kc_username_account: str | None,
+    kc_password_account: str | None,
+    kc_set_username: str | None,
+    kc_set_password: str | None,
+    username: str | None,
+    password: str | None,
+    set_active: bool,
+) -> None:
     """Create a new profile.
 
     \b
@@ -699,7 +650,8 @@ def profile_create(
     \b
       # macOS Keychain
       profile create stg --url https://kibana-stg.example.com --auth keychain \\
-        --kc-service kibana-stg --kc-username-account kibana-user --kc-password-account kibana-pass \\
+        --kc-service kibana-stg --kc-username-account kibana-user \\
+        --kc-password-account kibana-pass \\
         --kc-set-username admin --kc-set-password s3cret --use
 
     \b
@@ -707,7 +659,7 @@ def profile_create(
       profile create dev --url http://localhost:5601 --auth plain \\
         --username admin --password admin --use
     """
-    auth: dict = {"type": auth_type}
+    auth: dict[str, str] = {"type": auth_type}
 
     if auth_type == "1password":
         if not op_username or not op_password:
@@ -723,111 +675,103 @@ def profile_create(
         if not kc_service:
             click.echo("Error: --kc-service required for keychain auth.", err=True)
             sys.exit(1)
-        svc = kc_service
-        u_acct = kc_username_account or f"{name}-username"
-        p_acct = kc_password_account or f"{name}-password"
-        auth["service"] = svc
-        auth["username_account"] = u_acct
-        auth["password_account"] = p_acct
+        service = kc_service
+        username_account = kc_username_account or f"{name}-username"
+        password_account = kc_password_account or f"{name}-password"
+        auth["service"] = service
+        auth["username_account"] = username_account
+        auth["password_account"] = password_account
 
-        # Optionally store creds in keychain right now
         if kc_set_username:
-            _keychain_write(svc, u_acct, kc_set_username)
+            _keychain_write(service, username_account, kc_set_username)
             click.echo(
-                f"Stored username in Keychain (service={svc}, account={u_acct})",
+                f"Stored username in Keychain (service={service}, account={username_account})",
                 err=True,
             )
         if kc_set_password:
-            _keychain_write(svc, p_acct, kc_set_password)
+            _keychain_write(service, password_account, kc_set_password)
             click.echo(
-                f"Stored password in Keychain (service={svc}, account={p_acct})",
+                f"Stored password in Keychain (service={service}, account={password_account})",
                 err=True,
             )
 
     elif auth_type == "plain":
         if not username or not password:
-            click.echo(
-                "Error: --username and --password required for plain auth.", err=True
-            )
+            click.echo("Error: --username and --password required for plain auth.", err=True)
             sys.exit(1)
-        click.echo(
-            "Warning: credentials stored in plain text in config file.", err=True
-        )
+        click.echo("Warning: credentials stored in plain text in config file.", err=True)
         auth["username"] = username
         auth["password"] = password
 
-    cfg = _load_config()
-    cfg["profiles"][name] = {"kibana_url": url.rstrip("/"), "auth": auth}
-    if set_active or cfg.get("active") is None:
-        cfg["active"] = name
-    _save_config(cfg)
-    active_note = " (active)" if cfg["active"] == name else ""
+    config = _load_config()
+    config["profiles"][name] = {"kibana_url": url.rstrip("/"), "auth": auth}
+    if set_active or config.get("active") is None:
+        config["active"] = name
+    _save_config(config)
+    active_note = " (active)" if config["active"] == name else ""
     click.echo(f"Created profile '{name}'{active_note}")
 
 
 @profile.command("list")
-def profile_list():
+def profile_list() -> None:
     """List all profiles."""
-    cfg = _load_config()
-    active = cfg.get("active")
-    profiles = cfg.get("profiles", {})
+    config = _load_config()
+    active = config.get("active")
+    profiles = config.get("profiles", {})
     if not profiles:
         click.echo("No profiles. Run: profile create <name> ...")
         return
-    for name, p in profiles.items():
+    for name, profile_data in profiles.items():
         marker = " *" if name == active else ""
-        auth_type = p.get("auth", {}).get("type", "?")
-        click.echo(f"{name}{marker}  {p['kibana_url']}  ({auth_type})")
+        auth_type = profile_data.get("auth", {}).get("type", "?")
+        click.echo(f"{name}{marker}  {profile_data['kibana_url']}  ({auth_type})")
 
 
 @profile.command("show")
 @click.argument("name", required=False, default=None)
-def profile_show(name):
+def profile_show(name: str | None) -> None:
     """Show profile details (active profile if name omitted)."""
-    cfg = _load_config()
-    pname = name or cfg.get("active")
-    if not pname:
+    config = _load_config()
+    profile_name = name or config.get("active")
+    if not profile_name:
         click.echo("No active profile.", err=True)
         sys.exit(1)
-    p = cfg.get("profiles", {}).get(pname)
-    if not p:
-        click.echo(f"Profile '{pname}' not found.", err=True)
+    profile_data = config.get("profiles", {}).get(profile_name)
+    if not profile_data:
+        click.echo(f"Profile '{profile_name}' not found.", err=True)
         sys.exit(1)
-    # Mask plain text password in output
-    display = json.loads(json.dumps(p))
-    if display.get("auth", {}).get("type") == "plain" and "password" in display.get(
-        "auth", {}
-    ):
+    display = json.loads(json.dumps(profile_data))
+    if display.get("auth", {}).get("type") == "plain" and "password" in display.get("auth", {}):
         display["auth"]["password"] = "***"
-    click.echo(json.dumps({pname: display}, indent=2))
+    click.echo(json.dumps({profile_name: display}, indent=2))
 
 
 @profile.command("use")
 @click.argument("name")
-def profile_use(name):
+def profile_use(name: str) -> None:
     """Set the active profile."""
-    cfg = _load_config()
-    if name not in cfg.get("profiles", {}):
+    config = _load_config()
+    if name not in config.get("profiles", {}):
         click.echo(f"Profile '{name}' not found.", err=True)
         sys.exit(1)
-    cfg["active"] = name
-    _save_config(cfg)
+    config["active"] = name
+    _save_config(config)
     click.echo(f"Active profile: {name}")
 
 
 @profile.command("delete")
 @click.argument("name")
-def profile_delete(name):
+def profile_delete(name: str) -> None:
     """Delete a profile."""
-    cfg = _load_config()
-    if name not in cfg.get("profiles", {}):
+    config = _load_config()
+    if name not in config.get("profiles", {}):
         click.echo(f"Profile '{name}' not found.", err=True)
         sys.exit(1)
-    del cfg["profiles"][name]
-    if cfg.get("active") == name:
-        remaining = list(cfg["profiles"].keys())
-        cfg["active"] = remaining[0] if remaining else None
-    _save_config(cfg)
+    del config["profiles"][name]
+    if config.get("active") == name:
+        remaining = list(config["profiles"].keys())
+        config["active"] = remaining[0] if remaining else None
+    _save_config(config)
     click.echo(f"Deleted profile '{name}'")
 
 
@@ -850,56 +794,56 @@ def profile_delete(name):
 @click.option("--username", default=None)
 @click.option("--password", default=None)
 def profile_update(
-    name,
-    url,
-    auth_type,
-    op_username,
-    op_password,
-    kc_service,
-    kc_username_account,
-    kc_password_account,
-    kc_set_username,
-    kc_set_password,
-    username,
-    password,
-):
+    name: str,
+    url: str | None,
+    auth_type: str | None,
+    op_username: str | None,
+    op_password: str | None,
+    kc_service: str | None,
+    kc_username_account: str | None,
+    kc_password_account: str | None,
+    kc_set_username: str | None,
+    kc_set_password: str | None,
+    username: str | None,
+    password: str | None,
+) -> None:
     """Update an existing profile's fields."""
-    cfg = _load_config()
-    p = cfg.get("profiles", {}).get(name)
-    if not p:
+    config = _load_config()
+    profile_data = config.get("profiles", {}).get(name)
+    if not profile_data:
         click.echo(f"Profile '{name}' not found.", err=True)
         sys.exit(1)
 
     if url:
-        p["kibana_url"] = url.rstrip("/")
+        profile_data["kibana_url"] = url.rstrip("/")
 
-    auth = p.get("auth", {})
+    auth = profile_data.get("auth", {})
     if auth_type:
         auth = {"type": auth_type}
 
-    at = auth.get("type")
-    if at == "1password":
+    current_type = auth.get("type")
+    if current_type == "1password":
         if op_username:
             auth["username_ref"] = op_username
         if op_password:
             auth["password_ref"] = op_password
-    elif at == "keychain":
+    elif current_type == "keychain":
         if kc_service:
             auth["service"] = kc_service
         if kc_username_account:
             auth["username_account"] = kc_username_account
         if kc_password_account:
             auth["password_account"] = kc_password_account
-        svc = auth.get("service", name)
+        service = auth.get("service", name)
         if kc_set_username:
             acct = auth.get("username_account", f"{name}-username")
-            _keychain_write(svc, acct, kc_set_username)
+            _keychain_write(service, acct, kc_set_username)
             click.echo("Updated username in Keychain", err=True)
         if kc_set_password:
             acct = auth.get("password_account", f"{name}-password")
-            _keychain_write(svc, acct, kc_set_password)
+            _keychain_write(service, acct, kc_set_password)
             click.echo("Updated password in Keychain", err=True)
-    elif at == "plain":
+    elif current_type == "plain":
         if username:
             auth["username"] = username
         if password:
@@ -907,365 +851,403 @@ def profile_update(
         if username or password:
             click.echo("Warning: credentials stored in plain text.", err=True)
 
-    p["auth"] = auth
-    cfg["profiles"][name] = p
-    _save_config(cfg)
+    profile_data["auth"] = auth
+    config["profiles"][name] = profile_data
+    _save_config(config)
     click.echo(f"Updated profile '{name}'")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# CLI: data commands
-# ═══════════════════════════════════════════════════════════════════════════
-
-# ── context ──
 
 
 @cli.command()
 @click.option("--refresh", is_flag=True, default=False)
 @click.option("--indices", default=None, help="Index patterns (csv)")
 @common
-def context(refresh, indices, prof_name, timeout, dry_run, explain, fp, fmt, nc):
+def context(
+    refresh: bool,
+    indices: str | None,
+    prof_name: str | None,
+    timeout: int,
+    dry_run: bool,
+    explain: bool,
+    filter_path: str | None,
+    fmt: str,
+    no_cache: bool,
+) -> None:
     """Compact context summary: indices, fields, doc counts. Cached."""
     prof = _get_profile(prof_name)
-    kw = _kw(timeout, dry_run, explain, fp)
-    if not refresh and not nc:
-        c = cache_get("context", CACHE_TTL_CONTEXT)
-        if c is not None:
-            emit(c, fmt)
+    kwargs = _es_kwargs(timeout, dry_run, explain, filter_path)
+    if not refresh and not no_cache:
+        cached = cache_get("context", CACHE_TTL_CONTEXT)
+        if cached is not None:
+            emit(cached, fmt)
             return
 
-    raw = es(prof, "GET", "_aliases", **kw)
-    al = _aliases(raw)
-    cache_put("aliases", al)
-    pxs = _prefixes(raw)
+    raw = es(prof, "GET", "_aliases", **kwargs)
+    aliases_data = _parse_aliases(raw)  # type: ignore[arg-type]
+    cache_put("aliases", aliases_data)
+    prefixes = _extract_prefixes(raw)  # type: ignore[arg-type]
 
-    pats = (
-        [p.strip() for p in indices.split(",")]
-        if indices
-        else pxs[:5]
-    )
+    patterns = [p.strip() for p in indices.split(",")] if indices else prefixes[:5]
 
-    maps: dict = {}
-    counts: dict = {}
-    for pat in pats:
+    mappings: dict[str, Any] = {}
+    counts: dict[str, int] = {}
+    for pattern in patterns:
         try:
-            m = fetch_mapping(prof, pat, nc=refresh or nc, **kw)
-            maps[pat] = next(iter(m.values()))
+            mapping = fetch_mapping(prof, pattern, no_cache=refresh or no_cache, **kwargs)
+            mappings[pattern] = next(iter(mapping.values()))
         except SystemExit:
             pass
         try:
-            c = es(prof, "POST", f"{pat}/_count", {"query": _time_must("1h")}, **kw)
-            counts[pat] = c.get("count", 0)
+            count_result = es(
+                prof, "POST", f"{pattern}/_count", {"query": _time_range_filter("1h")}, **kwargs
+            )
+            counts[pattern] = count_result.get("count", 0)  # type: ignore[union-attr]
         except (SystemExit, Exception):
             pass
 
     ctx = {
-        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "prefixes": pxs,
-        "aliases": al,
-        "mappings": maps,
+        "ts": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "prefixes": prefixes,
+        "aliases": aliases_data,
+        "mappings": mappings,
         "counts_1h": counts,
     }
     cache_put("context", ctx)
     emit(ctx, fmt)
 
 
-# ── aliases ──
-
-
 @cli.command()
 @common
-def aliases(prof_name, timeout, dry_run, explain, fp, fmt, nc):
+def aliases(
+    prof_name: str | None,
+    timeout: int,
+    dry_run: bool,
+    explain: bool,
+    filter_path: str | None,
+    fmt: str,
+    no_cache: bool,
+) -> None:
     """List index aliases."""
     emit(
-        fetch_aliases(_get_profile(prof_name), nc=nc, **_kw(timeout, dry_run, explain, fp)),
+        fetch_aliases(
+            _get_profile(prof_name),
+            no_cache=no_cache,
+            **_es_kwargs(timeout, dry_run, explain, filter_path),
+        ),
         fmt,
     )
-
-
-# ── mapping ──
 
 
 @cli.command()
 @click.argument("index_pattern")
 @click.option("--full", is_flag=True, default=False)
 @common
-def mapping(index_pattern, full, prof_name, timeout, dry_run, explain, fp, fmt, nc):
+def mapping(
+    index_pattern: str,
+    full: bool,
+    prof_name: str | None,
+    timeout: int,
+    dry_run: bool,
+    explain: bool,
+    filter_path: str | None,
+    fmt: str,
+    no_cache: bool,
+) -> None:
     """Index mapping (flat field:type, deduped)."""
     prof = _get_profile(prof_name)
-    kw = _kw(timeout, dry_run, explain, fp)
+    kwargs = _es_kwargs(timeout, dry_run, explain, filter_path)
     emit(
-        es(prof, "GET", f"{index_pattern}/_mapping", **kw)
+        es(prof, "GET", f"{index_pattern}/_mapping", **kwargs)
         if full
-        else fetch_mapping(prof, index_pattern, nc=nc, **kw),
+        else fetch_mapping(prof, index_pattern, no_cache=no_cache, **kwargs),
         fmt,
     )
-
-
-# ── fields ──
 
 
 @cli.command()
 @click.argument("index_pattern")
 @click.argument("glob", default="*")
 @common
-def fields(index_pattern, glob, prof_name, timeout, dry_run, explain, fp, fmt, nc):
+def fields(
+    index_pattern: str,
+    glob: str,
+    prof_name: str | None,
+    timeout: int,
+    dry_run: bool,
+    explain: bool,
+    filter_path: str | None,
+    fmt: str,
+    no_cache: bool,
+) -> None:
     """Field names matching GLOB."""
     flat = fetch_mapping(
-        _get_profile(prof_name), index_pattern, nc=nc, **_kw(timeout, dry_run, explain, fp)
+        _get_profile(prof_name),
+        index_pattern,
+        no_cache=no_cache,
+        **_es_kwargs(timeout, dry_run, explain, filter_path),
     )
     matched = {
         k: v
-        for _, fm in flat.items()
-        for k, v in sorted(fm.items())
+        for _, field_map in flat.items()
+        for k, v in sorted(field_map.items())
         if fnmatch.fnmatch(k, glob)
     }
     emit(matched, fmt)
 
 
-# ── count ──
-
-
 @cli.command()
 @click.argument("index_pattern")
-@click.option("--last", "tr", default=DEFAULT_TIME_RANGE)
-@click.option("-q", "--query", "eq", default=None)
+@click.option("--last", "time_range", default=DEFAULT_TIME_RANGE)
+@click.option("-q", "--query", "extra_query", default=None)
 @common
-def count(index_pattern, tr, eq, prof_name, timeout, dry_run, explain, fp, fmt, nc):
+def count(
+    index_pattern: str,
+    time_range: str,
+    extra_query: str | None,
+    prof_name: str | None,
+    timeout: int,
+    dry_run: bool,
+    explain: bool,
+    filter_path: str | None,
+    fmt: str,
+    no_cache: bool,
+) -> None:
     """Count documents."""
-    must = [_time_must(tr)]
-    if eq:
-        must.append(json.loads(eq))
-    d = es(
+    must = [_time_range_filter(time_range)]
+    if extra_query:
+        must.append(json.loads(extra_query))
+    data = es(
         _get_profile(prof_name),
         "POST",
         f"{index_pattern}/_count",
         {"query": {"bool": {"must": must}}},
-        **_kw(timeout, dry_run, explain, fp),
+        **_es_kwargs(timeout, dry_run, explain, filter_path),
     )
-    click.echo(d.get("count", d))
-
-
-# ── search ──
+    click.echo(data.get("count", data))  # type: ignore[union-attr]
 
 
 @cli.command()
 @click.argument("index_pattern")
-@click.option("--last", "tr", default=DEFAULT_TIME_RANGE)
+@click.option("--last", "time_range", default=DEFAULT_TIME_RANGE)
 @click.option("-n", "--size", default=DEFAULT_SIZE, type=int)
-@click.option("-q", "--query", "eq", default=None)
-@click.option("-f", "--fields", "fc", default=None)
-@click.option("--sort", "sf", default=DEFAULT_SORT)
+@click.option("-q", "--query", "extra_query", default=None)
+@click.option("-f", "--fields", "field_csv", default=None)
+@click.option("--sort", "sort_field", default=DEFAULT_SORT)
 @click.option("--aggs", default=None)
-@click.option("--max-source-len", "msl", default=MAX_SOURCE_LEN, type=int)
+@click.option("--max-source-len", "max_source_len", default=MAX_SOURCE_LEN, type=int)
 @common
 def search(
-    index_pattern,
-    tr,
-    size,
-    eq,
-    fc,
-    sf,
-    aggs,
-    msl,
-    prof_name,
-    timeout,
-    dry_run,
-    explain,
-    fp,
-    fmt,
-    nc,
-):
+    index_pattern: str,
+    time_range: str,
+    size: int,
+    extra_query: str | None,
+    field_csv: str | None,
+    sort_field: str,
+    aggs: str | None,
+    max_source_len: int,
+    prof_name: str | None,
+    timeout: int,
+    dry_run: bool,
+    explain: bool,
+    filter_path: str | None,
+    fmt: str,
+    no_cache: bool,
+) -> None:
     """Search recent logs."""
-    must = [_time_must(tr)]
-    if eq:
-        must.append(json.loads(eq))
-    body: dict = {"query": {"bool": {"must": must}}, "size": size}
-    s, _, o = sf.partition(":")
-    body["sort"] = [{s: o or "desc"}]
-    fl = _fl(fc)
-    if fl:
-        body["_source"] = fl
+    must = [_time_range_filter(time_range)]
+    if extra_query:
+        must.append(json.loads(extra_query))
+    body: dict[str, Any] = {"query": {"bool": {"must": must}}, "size": size}
+    sort_key, _, sort_order = sort_field.partition(":")
+    body["sort"] = [{sort_key: sort_order or "desc"}]
+    field_list = _parse_fields(field_csv)
+    if field_list:
+        body["_source"] = field_list
     if aggs:
         body["aggregations"] = json.loads(aggs)
-    d = es(
+    data = es(
         _get_profile(prof_name),
         "POST",
         f"{index_pattern}/_search",
         body,
-        **_kw(timeout, dry_run, explain, fp),
+        **_es_kwargs(timeout, dry_run, explain, filter_path),
     )
-    emit(_search_result(d, fl, msl), fmt)
-
-
-# ── tail ──
+    emit(_format_search_result(data, field_list, max_source_len), fmt)  # type: ignore[arg-type]
 
 
 @cli.command()
 @click.argument("index_pattern")
 @click.option("--interval", default=2.0, type=float)
-@click.option("--last", "tr", default="1m")
-@click.option("-q", "--query", "eq", default=None)
-@click.option("-f", "--fields", "fc", default=None)
+@click.option("--last", "time_range", default="1m")
+@click.option("-q", "--query", "extra_query", default=None)
+@click.option("-f", "--fields", "field_csv", default=None)
 @click.option("-n", "--size", default=50, type=int)
-@click.option("--max-source-len", "msl", default=MAX_SOURCE_LEN, type=int)
+@click.option("--max-source-len", "max_source_len", default=MAX_SOURCE_LEN, type=int)
 @common
 def tail(
-    index_pattern,
-    interval,
-    tr,
-    eq,
-    fc,
-    size,
-    msl,
-    prof_name,
-    timeout,
-    dry_run,
-    explain,
-    fp,
-    fmt,
-    nc,
-):
+    index_pattern: str,
+    interval: float,
+    time_range: str,
+    extra_query: str | None,
+    field_csv: str | None,
+    size: int,
+    max_source_len: int,
+    prof_name: str | None,
+    timeout: int,
+    dry_run: bool,
+    explain: bool,
+    filter_path: str | None,
+    fmt: str,
+    no_cache: bool,
+) -> None:
     """Stream logs (search_after). Ctrl+C to stop."""
     prof = _get_profile(prof_name)
-    fl = _fl(fc)
-    must_base = [json.loads(eq)] if eq else []
-    sa: list | None = None
+    field_list = _parse_fields(field_csv)
+    base_must = [json.loads(extra_query)] if extra_query else []
+    search_after: list[Any] | None = None
     first = True
-    signal.signal(signal.SIGINT, lambda *_: (click.echo("", err=True), sys.exit(0)))
+
+    def _handle_sigint(*_: object) -> None:
+        click.echo("", err=True)
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, _handle_sigint)
 
     while True:
-        must = list(must_base)
-        if sa is None:
-            must.append(_time_must(tr))
-        body: dict = {
+        must = list(base_must)
+        if search_after is None:
+            must.append(_time_range_filter(time_range))
+        body: dict[str, Any] = {
             "query": {"bool": {"must": must}},
             "size": size,
             "sort": [{"@timestamp": "asc"}, {"_id": "asc"}],
         }
-        if fl:
-            body["_source"] = fl
-        if sa is not None:
-            body["search_after"] = sa
+        if field_list:
+            body["_source"] = field_list
+        if search_after is not None:
+            body["search_after"] = search_after
         try:
-            d = es(
+            data = es(
                 prof,
                 "POST",
                 f"{index_pattern}/_search",
                 body,
-                **_kw(timeout, dry_run, explain and first, fp),
+                **_es_kwargs(timeout, dry_run, explain and first, filter_path),
             )
         except SystemExit:
             raise
-        except Exception as e:
-            click.echo(f"err: {e}", err=True)
+        except Exception as exc:
+            click.echo(f"err: {exc}", err=True)
             time.sleep(interval)
             continue
-        for h in d.get("hits", {}).get("hits", []):
-            ch = _hit(h, fl)
-            s = json.dumps(ch, ensure_ascii=False, separators=(",", ":"))
-            click.echo(s[:msl] + "…" if msl and len(s) > msl else s)
-        hits = d.get("hits", {}).get("hits", [])
+        for hit in data.get("hits", {}).get("hits", []):  # type: ignore[union-attr]
+            formatted = _format_hit(hit, field_list)
+            serialized = json.dumps(formatted, ensure_ascii=False, separators=(",", ":"))
+            click.echo(
+                serialized[:max_source_len] + "…"
+                if max_source_len and len(serialized) > max_source_len
+                else serialized
+            )
+        hits = data.get("hits", {}).get("hits", [])  # type: ignore[union-attr]
         if hits:
-            sa = hits[-1].get("sort")
+            search_after = hits[-1].get("sort")
         first = False
         time.sleep(interval)
 
 
-# ── histogram ──
-
-
 @cli.command()
 @click.argument("index_pattern")
-@click.option("--last", "tr", default=DEFAULT_TIME_RANGE)
+@click.option("--last", "time_range", default=DEFAULT_TIME_RANGE)
 @click.option("--interval", default="5m")
-@click.option("-q", "--query", "eq", default=None)
-@click.option("--field", "tf", default="@timestamp")
+@click.option("-q", "--query", "extra_query", default=None)
+@click.option("--field", "time_field", default="@timestamp")
 @common
 def histogram(
-    index_pattern,
-    tr,
-    interval,
-    eq,
-    tf,
-    prof_name,
-    timeout,
-    dry_run,
-    explain,
-    fp,
-    fmt,
-    nc,
-):
+    index_pattern: str,
+    time_range: str,
+    interval: str,
+    extra_query: str | None,
+    time_field: str,
+    prof_name: str | None,
+    timeout: int,
+    dry_run: bool,
+    explain: bool,
+    filter_path: str | None,
+    fmt: str,
+    no_cache: bool,
+) -> None:
     """Date histogram of doc counts."""
-    must = [_time_must(tr, tf)]
-    if eq:
-        must.append(json.loads(eq))
-    body = {
+    must = [_time_range_filter(time_range, time_field)]
+    if extra_query:
+        must.append(json.loads(extra_query))
+    body: dict[str, Any] = {
         "size": 0,
         "query": {"bool": {"must": must}},
         "aggregations": {
             "t": {
                 "date_histogram": {
-                    "field": tf,
+                    "field": time_field,
                     "fixed_interval": interval,
                     "min_doc_count": 0,
                 }
             }
         },
     }
-    d = es(
+    data = es(
         _get_profile(prof_name),
         "POST",
         f"{index_pattern}/_search",
         body,
-        **_kw(timeout, dry_run, explain, fp),
+        **_es_kwargs(timeout, dry_run, explain, filter_path),
     )
-    bkts = d.get("aggregations", {}).get("t", {}).get("buckets", [])
-    total = d.get("hits", {}).get("total", {})
+    buckets = data.get("aggregations", {}).get("t", {}).get("buckets", [])  # type: ignore[union-attr]
+    total = data.get("hits", {}).get("total", {})  # type: ignore[union-attr]
     if isinstance(total, dict):
         total = total.get("value", "?")
     emit(
         {
             "total": total,
             "interval": interval,
-            "buckets": [{"t": b["key_as_string"], "n": b["doc_count"]} for b in bkts],
+            "buckets": [{"t": b["key_as_string"], "n": b["doc_count"]} for b in buckets],
         },
         fmt,
     )
 
 
-# ── discover ──
-
-
 @cli.command()
 @click.argument("index_pattern")
-@click.option("--last", "tr", default=DEFAULT_TIME_RANGE)
+@click.option("--last", "time_range", default=DEFAULT_TIME_RANGE)
 @click.option("--kql", default=None, help="KQL query")
 @click.option("--lucene", default=None, help="Lucene query")
-@click.option("-f", "--fields", "fc", default=None, help="Columns (csv)")
+@click.option("-f", "--fields", "field_csv", default=None, help="Columns (csv)")
 @click.option("--profile", "prof_name", default=None, envvar="KIBANA_AGENT_PROFILE")
-def discover(index_pattern, tr, kql, lucene, fc, prof_name):
+def discover(
+    index_pattern: str,
+    time_range: str,
+    kql: str | None,
+    lucene: str | None,
+    field_csv: str | None,
+    prof_name: str | None,
+) -> None:
     """Build a Kibana Discover URL."""
     if kql and lucene:
         click.echo("Error: --kql or --lucene, not both.", err=True)
         sys.exit(1)
     prof = _get_profile(prof_name)
     lang = "kuery" if not lucene else "lucene"
-    g = {
-        "time": {"from": f"now-{tr}", "to": "now"},
+    global_state = {
+        "time": {"from": f"now-{time_range}", "to": "now"},
         "refreshInterval": {"pause": True, "value": 0},
     }
-    a: dict = {
+    app_state: dict[str, Any] = {
         "query": {"language": lang, "query": kql or lucene or ""},
     }
-    cols = _fl(fc)
-    if cols:
-        a["columns"] = cols
-    click.echo(f"{prof['kibana_url']}/app/discover#/?_g={_rison(g)}&_a={_rison(a)}")
+    columns = _parse_fields(field_csv)
+    if columns:
+        app_state["columns"] = columns
+    click.echo(
+        f"{prof['kibana_url']}/app/discover#/?_g={_rison(global_state)}&_a={_rison(app_state)}"
+    )
     click.echo(f"Note: select the '{index_pattern}' data view manually in Kibana.", err=True)
-
-
-# ── raw ──
 
 
 @cli.command()
@@ -1273,23 +1255,31 @@ def discover(index_pattern, tr, kql, lucene, fc, prof_name):
 @click.argument("es_path")
 @click.option("--body", default=None)
 @common
-def raw(method, es_path, body, prof_name, timeout, dry_run, explain, fp, fmt, nc):
+def raw(
+    method: str,
+    es_path: str,
+    body: str | None,
+    prof_name: str | None,
+    timeout: int,
+    dry_run: bool,
+    explain: bool,
+    filter_path: str | None,
+    fmt: str,
+    no_cache: bool,
+) -> None:
     """Raw read-only ES request."""
-    d = es(
+    data = es(
         _get_profile(prof_name),
         method.upper(),
         es_path,
         json.loads(body) if body else None,
-        **_kw(timeout, dry_run, explain, fp),
+        **_es_kwargs(timeout, dry_run, explain, filter_path),
     )
-    emit(d, fmt)
-
-
-# ── cache-clear ──
+    emit(data, fmt)
 
 
 @cli.command("cache-clear")
-def cache_clear():
+def cache_clear() -> None:
     """Wipe all cached data (including Keychain credential cache)."""
     _cached_creds_clear()
     click.echo(f"Cleared {cache_clear_all()} files from {CACHE_DIR}")
@@ -1297,7 +1287,7 @@ def cache_clear():
 
 
 @cli.command("agent-help")
-def agent_help():
+def agent_help() -> None:
     """Print a usage guide for AI agents."""
     click.echo("""\
 # kibana-agent — AI Agent Usage Guide
