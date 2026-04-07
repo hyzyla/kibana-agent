@@ -571,7 +571,7 @@ def _rison(obj: object) -> str:
     if isinstance(obj, (int, float)):
         return str(obj)
     if isinstance(obj, str):
-        if re.match(r"^[a-zA-Z0-9_.~*:\-/]+$", obj) and obj not in ("!t", "!f", "!n"):
+        if re.match(r"^[a-zA-Z_~/.][-a-zA-Z0-9_~/.]*$", obj) and obj not in ("!t", "!f", "!n"):
             return obj
         return "'" + obj.replace("!", "!!").replace("'", "!'") + "'"
     if isinstance(obj, (list, tuple)):
@@ -1256,13 +1256,13 @@ def discover(index_pattern, tr, kql, lucene, fc, prof_name):
         "refreshInterval": {"pause": True, "value": 0},
     }
     a: dict = {
-        "index": index_pattern,
         "query": {"language": lang, "query": kql or lucene or ""},
     }
     cols = _fl(fc)
     if cols:
         a["columns"] = cols
     click.echo(f"{prof['kibana_url']}/app/discover#/?_g={_rison(g)}&_a={_rison(a)}")
+    click.echo(f"Note: select the '{index_pattern}' data view manually in Kibana.", err=True)
 
 
 # ── raw ──
