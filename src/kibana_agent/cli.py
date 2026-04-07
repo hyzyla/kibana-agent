@@ -53,6 +53,8 @@ from urllib.parse import urlencode
 import click
 import requests
 
+from kibana_agent.kql import kql_to_es
+
 CONFIG_DIR = Path.home() / ".config" / "kibana-agent"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 CACHE_DIR = Path.home() / ".cache" / "kibana-agent"
@@ -998,11 +1000,13 @@ def fields(
 @click.argument("index_pattern")
 @click.option("--last", "time_range", default=DEFAULT_TIME_RANGE)
 @click.option("-q", "--query", "extra_query", default=None)
+@click.option("--kql", "kql_query", default=None, help="KQL filter")
 @common
 def count(
     index_pattern: str,
     time_range: str,
     extra_query: str | None,
+    kql_query: str | None,
     prof_name: str | None,
     timeout: int,
     dry_run: bool,
@@ -1015,6 +1019,8 @@ def count(
     must = [_time_range_filter(time_range)]
     if extra_query:
         must.append(json.loads(extra_query))
+    if kql_query:
+        must.append(kql_to_es(kql_query))
     data = es(
         _get_profile(prof_name),
         "POST",
@@ -1030,6 +1036,7 @@ def count(
 @click.option("--last", "time_range", default=DEFAULT_TIME_RANGE)
 @click.option("-n", "--size", default=DEFAULT_SIZE, type=int)
 @click.option("-q", "--query", "extra_query", default=None)
+@click.option("--kql", "kql_query", default=None, help="KQL filter")
 @click.option("-f", "--fields", "field_csv", default=None)
 @click.option("--sort", "sort_field", default=DEFAULT_SORT)
 @click.option("--aggs", default=None)
@@ -1040,6 +1047,7 @@ def search(
     time_range: str,
     size: int,
     extra_query: str | None,
+    kql_query: str | None,
     field_csv: str | None,
     sort_field: str,
     aggs: str | None,
@@ -1056,6 +1064,8 @@ def search(
     must = [_time_range_filter(time_range)]
     if extra_query:
         must.append(json.loads(extra_query))
+    if kql_query:
+        must.append(kql_to_es(kql_query))
     body: dict[str, Any] = {"query": {"bool": {"must": must}}, "size": size}
     sort_key, _, sort_order = sort_field.partition(":")
     body["sort"] = [{sort_key: sort_order or "desc"}]
@@ -1079,6 +1089,7 @@ def search(
 @click.option("--interval", default=2.0, type=float)
 @click.option("--last", "time_range", default="1m")
 @click.option("-q", "--query", "extra_query", default=None)
+@click.option("--kql", "kql_query", default=None, help="KQL filter")
 @click.option("-f", "--fields", "field_csv", default=None)
 @click.option("-n", "--size", default=50, type=int)
 @click.option("--max-source-len", "max_source_len", default=MAX_SOURCE_LEN, type=int)
@@ -1088,6 +1099,7 @@ def tail(
     interval: float,
     time_range: str,
     extra_query: str | None,
+    kql_query: str | None,
     field_csv: str | None,
     size: int,
     max_source_len: int,
@@ -1102,7 +1114,9 @@ def tail(
     """Stream logs (search_after). Ctrl+C to stop."""
     prof = _get_profile(prof_name)
     field_list = _parse_fields(field_csv)
-    base_must = [json.loads(extra_query)] if extra_query else []
+    base_must: list[Any] = [json.loads(extra_query)] if extra_query else []
+    if kql_query:
+        base_must.append(kql_to_es(kql_query))
     search_after: list[Any] | None = None
     first = True
 
@@ -1159,6 +1173,7 @@ def tail(
 @click.option("--last", "time_range", default=DEFAULT_TIME_RANGE)
 @click.option("--interval", default="5m")
 @click.option("-q", "--query", "extra_query", default=None)
+@click.option("--kql", "kql_query", default=None, help="KQL filter")
 @click.option("--field", "time_field", default="@timestamp")
 @common
 def histogram(
@@ -1166,6 +1181,7 @@ def histogram(
     time_range: str,
     interval: str,
     extra_query: str | None,
+    kql_query: str | None,
     time_field: str,
     prof_name: str | None,
     timeout: int,
@@ -1179,6 +1195,8 @@ def histogram(
     must = [_time_range_filter(time_range, time_field)]
     if extra_query:
         must.append(json.loads(extra_query))
+    if kql_query:
+        must.append(kql_to_es(kql_query))
     body: dict[str, Any] = {
         "size": 0,
         "query": {"bool": {"must": must}},
