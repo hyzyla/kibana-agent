@@ -594,7 +594,7 @@ def _parse_fields(csv: str | None) -> list[str] | None:
 
 
 @click.group()
-@click.version_option("0.1.0")
+@click.version_option("0.2.0")
 def cli() -> None:
     """Read-only Kibana/ES CLI for AI agents."""
 
