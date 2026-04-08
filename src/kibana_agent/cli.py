@@ -370,8 +370,9 @@ def es(
     if explain and body:
         click.echo(json.dumps(body, ensure_ascii=False, separators=(",", ":")), err=True)
     url = profile["kibana_url"].rstrip("/")
+    prefix = _space_prefix(profile)
     if dry_run:
-        click.echo(_build_curl(url, method, path, body, timeout, filter_path))
+        click.echo(_build_curl(url + prefix, method, path, body, timeout, filter_path))
         sys.exit(0)
 
     username, password = creds(profile)
@@ -379,7 +380,7 @@ def es(
         ("&" if "?" in path else "?") + f"filter_path={filter_path}" if filter_path else ""
     )
     response = requests.post(
-        f"{url}/api/console/proxy",
+        f"{url}{prefix}/api/console/proxy",
         params={"path": actual_path, "method": method},
         headers={"kbn-xsrf": "true", "Content-Type": "application/json"},
         json=body,
@@ -396,6 +397,28 @@ def es(
 
 def _strip_empty(data: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in data.items() if v is not None and v != "" and v != [] and v != {}}
+
+
+def _space_prefix(profile: dict[str, Any]) -> str:
+    space = profile.get("space")
+    return f"/s/{space}" if space else ""
+
+
+def _resolve_index(profile: dict[str, Any], index_pattern: str | None) -> str:
+    default_index = profile.get("index")
+    if index_pattern is not None:
+        if profile.get("restrict_index") and default_index and index_pattern != default_index:
+            click.echo(
+                f"Error: profile restricts index to '{default_index}', "
+                f"got '{index_pattern}'.",
+                err=True,
+            )
+            sys.exit(1)
+        return index_pattern
+    if default_index:
+        return default_index
+    click.echo("Error: no index pattern given and profile has no default index.", err=True)
+    sys.exit(1)
 
 
 def _format_hit(hit: dict[str, Any], field_list: list[str] | None) -> dict[str, Any]:
@@ -625,6 +648,10 @@ def profile() -> None:
 @click.option("--kc-set-password", default=None, help="Store this password in Keychain now")
 @click.option("--username", default=None, help="Plain text username")
 @click.option("--password", default=None, help="Plain text password")
+@click.option("--space", default=None, help="Kibana Space ID (e.g. backend)")
+@click.option("--index", default=None, help="Default index pattern (e.g. logs-*)")
+@click.option("--restrict-space", is_flag=True, default=False, help="Restrict to configured space")
+@click.option("--restrict-index", is_flag=True, default=False, help="Restrict to configured index")
 @click.option("--use", "set_active", is_flag=True, default=False, help="Set as active profile")
 def profile_create(
     name: str,
@@ -639,6 +666,10 @@ def profile_create(
     kc_set_password: str | None,
     username: str | None,
     password: str | None,
+    space: str | None,
+    index: str | None,
+    restrict_space: bool,
+    restrict_index: bool,
     set_active: bool,
 ) -> None:
     """Create a new profile.
@@ -648,6 +679,12 @@ def profile_create(
       # 1Password
       profile create prd --url https://kibana.example.com --auth 1password \\
         --op-username "op://vault/item/username" --op-password "op://vault/item/password" --use
+
+    \b
+      # With space and default index
+      profile create prd --url https://kibana.example.com --auth 1password \\
+        --op-username "op://vault/item/username" --op-password "op://vault/item/password" \\
+        --space backend --index logs-* --restrict-index --use
 
     \b
       # macOS Keychain
@@ -706,7 +743,16 @@ def profile_create(
         auth["password"] = password
 
     config = _load_config()
-    config["profiles"][name] = {"kibana_url": url.rstrip("/"), "auth": auth}
+    profile_data: dict[str, Any] = {"kibana_url": url.rstrip("/"), "auth": auth}
+    if space:
+        profile_data["space"] = space
+    if index:
+        profile_data["index"] = index
+    if restrict_space:
+        profile_data["restrict_space"] = True
+    if restrict_index:
+        profile_data["restrict_index"] = True
+    config["profiles"][name] = profile_data
     if set_active or config.get("active") is None:
         config["active"] = name
     _save_config(config)
@@ -726,7 +772,16 @@ def profile_list() -> None:
     for name, profile_data in profiles.items():
         marker = " *" if name == active else ""
         auth_type = profile_data.get("auth", {}).get("type", "?")
-        click.echo(f"{name}{marker}  {profile_data['kibana_url']}  ({auth_type})")
+        parts = [f"{name}{marker}  {profile_data['kibana_url']}  ({auth_type})"]
+        space = profile_data.get("space")
+        if space:
+            lock = " restricted" if profile_data.get("restrict_space") else ""
+            parts.append(f"[space: {space}{lock}]")
+        idx = profile_data.get("index")
+        if idx:
+            lock = " restricted" if profile_data.get("restrict_index") else ""
+            parts.append(f"[index: {idx}{lock}]")
+        click.echo("  ".join(parts))
 
 
 @profile.command("show")
@@ -795,6 +850,12 @@ def profile_delete(name: str) -> None:
 @click.option("--kc-set-password", default=None, help="Update password in Keychain")
 @click.option("--username", default=None)
 @click.option("--password", default=None)
+@click.option("--space", default=None, help="Kibana Space ID")
+@click.option("--no-space", "clear_space", is_flag=True, default=False, help="Remove space")
+@click.option("--index", default=None, help="Default index pattern")
+@click.option("--no-index", "clear_index", is_flag=True, default=False, help="Remove default index")
+@click.option("--restrict-space/--no-restrict-space", default=None, help="Restrict space")
+@click.option("--restrict-index/--no-restrict-index", default=None, help="Restrict index")
 def profile_update(
     name: str,
     url: str | None,
@@ -808,6 +869,12 @@ def profile_update(
     kc_set_password: str | None,
     username: str | None,
     password: str | None,
+    space: str | None,
+    clear_space: bool,
+    index: str | None,
+    clear_index: bool,
+    restrict_space: bool | None,
+    restrict_index: bool | None,
 ) -> None:
     """Update an existing profile's fields."""
     config = _load_config()
@@ -854,6 +921,26 @@ def profile_update(
             click.echo("Warning: credentials stored in plain text.", err=True)
 
     profile_data["auth"] = auth
+
+    if space:
+        profile_data["space"] = space
+    if clear_space:
+        profile_data.pop("space", None)
+    if index:
+        profile_data["index"] = index
+    if clear_index:
+        profile_data.pop("index", None)
+    if restrict_space is not None:
+        if restrict_space:
+            profile_data["restrict_space"] = True
+        else:
+            profile_data.pop("restrict_space", None)
+    if restrict_index is not None:
+        if restrict_index:
+            profile_data["restrict_index"] = True
+        else:
+            profile_data.pop("restrict_index", None)
+
     config["profiles"][name] = profile_data
     _save_config(config)
     click.echo(f"Updated profile '{name}'")
@@ -940,11 +1027,11 @@ def aliases(
 
 
 @cli.command()
-@click.argument("index_pattern")
+@click.argument("index_pattern", required=False, default=None)
 @click.option("--full", is_flag=True, default=False)
 @common
 def mapping(
-    index_pattern: str,
+    index_pattern: str | None,
     full: bool,
     prof_name: str | None,
     timeout: int,
@@ -956,6 +1043,7 @@ def mapping(
 ) -> None:
     """Index mapping (flat field:type, deduped)."""
     prof = _get_profile(prof_name)
+    index_pattern = _resolve_index(prof, index_pattern)
     kwargs = _es_kwargs(timeout, dry_run, explain, filter_path)
     emit(
         es(prof, "GET", f"{index_pattern}/_mapping", **kwargs)
@@ -966,11 +1054,11 @@ def mapping(
 
 
 @cli.command()
-@click.argument("index_pattern")
+@click.argument("index_pattern", required=False, default=None)
 @click.argument("glob", default="*")
 @common
 def fields(
-    index_pattern: str,
+    index_pattern: str | None,
     glob: str,
     prof_name: str | None,
     timeout: int,
@@ -981,8 +1069,10 @@ def fields(
     no_cache: bool,
 ) -> None:
     """Field names matching GLOB."""
+    prof = _get_profile(prof_name)
+    index_pattern = _resolve_index(prof, index_pattern)
     flat = fetch_mapping(
-        _get_profile(prof_name),
+        prof,
         index_pattern,
         no_cache=no_cache,
         **_es_kwargs(timeout, dry_run, explain, filter_path),
@@ -997,13 +1087,13 @@ def fields(
 
 
 @cli.command()
-@click.argument("index_pattern")
+@click.argument("index_pattern", required=False, default=None)
 @click.option("--last", "time_range", default=DEFAULT_TIME_RANGE)
 @click.option("-q", "--query", "extra_query", default=None)
 @click.option("--kql", "kql_query", default=None, help="KQL filter")
 @common
 def count(
-    index_pattern: str,
+    index_pattern: str | None,
     time_range: str,
     extra_query: str | None,
     kql_query: str | None,
@@ -1016,13 +1106,15 @@ def count(
     no_cache: bool,
 ) -> None:
     """Count documents."""
+    prof = _get_profile(prof_name)
+    index_pattern = _resolve_index(prof, index_pattern)
     must = [_time_range_filter(time_range)]
     if extra_query:
         must.append(json.loads(extra_query))
     if kql_query:
         must.append(kql_to_es(kql_query))
     data = es(
-        _get_profile(prof_name),
+        prof,
         "POST",
         f"{index_pattern}/_count",
         {"query": {"bool": {"must": must}}},
@@ -1032,7 +1124,7 @@ def count(
 
 
 @cli.command()
-@click.argument("index_pattern")
+@click.argument("index_pattern", required=False, default=None)
 @click.option("--last", "time_range", default=DEFAULT_TIME_RANGE)
 @click.option("-n", "--size", default=DEFAULT_SIZE, type=int)
 @click.option("-q", "--query", "extra_query", default=None)
@@ -1043,7 +1135,7 @@ def count(
 @click.option("--max-source-len", "max_source_len", default=MAX_SOURCE_LEN, type=int)
 @common
 def search(
-    index_pattern: str,
+    index_pattern: str | None,
     time_range: str,
     size: int,
     extra_query: str | None,
@@ -1061,6 +1153,8 @@ def search(
     no_cache: bool,
 ) -> None:
     """Search recent logs."""
+    prof = _get_profile(prof_name)
+    index_pattern = _resolve_index(prof, index_pattern)
     must = [_time_range_filter(time_range)]
     if extra_query:
         must.append(json.loads(extra_query))
@@ -1075,7 +1169,7 @@ def search(
     if aggs:
         body["aggregations"] = json.loads(aggs)
     data = es(
-        _get_profile(prof_name),
+        prof,
         "POST",
         f"{index_pattern}/_search",
         body,
@@ -1085,7 +1179,7 @@ def search(
 
 
 @cli.command()
-@click.argument("index_pattern")
+@click.argument("index_pattern", required=False, default=None)
 @click.option("--interval", default=2.0, type=float)
 @click.option("--last", "time_range", default="1m")
 @click.option("-q", "--query", "extra_query", default=None)
@@ -1095,7 +1189,7 @@ def search(
 @click.option("--max-source-len", "max_source_len", default=MAX_SOURCE_LEN, type=int)
 @common
 def tail(
-    index_pattern: str,
+    index_pattern: str | None,
     interval: float,
     time_range: str,
     extra_query: str | None,
@@ -1113,6 +1207,7 @@ def tail(
 ) -> None:
     """Stream logs (search_after). Ctrl+C to stop."""
     prof = _get_profile(prof_name)
+    index_pattern = _resolve_index(prof, index_pattern)
     field_list = _parse_fields(field_csv)
     base_must: list[Any] = [json.loads(extra_query)] if extra_query else []
     if kql_query:
@@ -1169,7 +1264,7 @@ def tail(
 
 
 @cli.command()
-@click.argument("index_pattern")
+@click.argument("index_pattern", required=False, default=None)
 @click.option("--last", "time_range", default=DEFAULT_TIME_RANGE)
 @click.option("--interval", default="5m")
 @click.option("-q", "--query", "extra_query", default=None)
@@ -1177,7 +1272,7 @@ def tail(
 @click.option("--field", "time_field", default="@timestamp")
 @common
 def histogram(
-    index_pattern: str,
+    index_pattern: str | None,
     time_range: str,
     interval: str,
     extra_query: str | None,
@@ -1192,6 +1287,8 @@ def histogram(
     no_cache: bool,
 ) -> None:
     """Date histogram of doc counts."""
+    prof = _get_profile(prof_name)
+    index_pattern = _resolve_index(prof, index_pattern)
     must = [_time_range_filter(time_range, time_field)]
     if extra_query:
         must.append(json.loads(extra_query))
@@ -1211,7 +1308,7 @@ def histogram(
         },
     }
     data = es(
-        _get_profile(prof_name),
+        prof,
         "POST",
         f"{index_pattern}/_search",
         body,
@@ -1232,14 +1329,14 @@ def histogram(
 
 
 @cli.command()
-@click.argument("index_pattern")
+@click.argument("index_pattern", required=False, default=None)
 @click.option("--last", "time_range", default=DEFAULT_TIME_RANGE)
 @click.option("--kql", default=None, help="KQL query")
 @click.option("--lucene", default=None, help="Lucene query")
 @click.option("-f", "--fields", "field_csv", default=None, help="Columns (csv)")
 @click.option("--profile", "prof_name", default=None, envvar="KIBANA_AGENT_PROFILE")
 def discover(
-    index_pattern: str,
+    index_pattern: str | None,
     time_range: str,
     kql: str | None,
     lucene: str | None,
@@ -1251,6 +1348,8 @@ def discover(
         click.echo("Error: --kql or --lucene, not both.", err=True)
         sys.exit(1)
     prof = _get_profile(prof_name)
+    index_pattern = _resolve_index(prof, index_pattern)
+    prefix = _space_prefix(prof)
     lang = "kuery" if not lucene else "lucene"
     global_state = {
         "time": {"from": f"now-{time_range}", "to": "now"},
@@ -1263,7 +1362,7 @@ def discover(
     if columns:
         app_state["columns"] = columns
     click.echo(
-        f"{prof['kibana_url']}/app/discover#/?_g={_rison(global_state)}&_a={_rison(app_state)}"
+        f"{prof['kibana_url']}{prefix}/app/discover#/?_g={_rison(global_state)}&_a={_rison(app_state)}"
     )
     click.echo(f"Note: select the '{index_pattern}' data view manually in Kibana.", err=True)
 
