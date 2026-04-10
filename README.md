@@ -18,7 +18,7 @@ kibana-agent profile create prd --url https://kibana.example.com --auth 1passwor
   --op-username "op://vault/item/username" --op-password "op://vault/item/password" --use
 ```
 
-Auth: `1password` (Touch ID, cached 30 min), `keychain` (macOS), `plain`.
+Auth: `1password` (Touch ID, cached 30 min), `keychain` (OS keyring — macOS Keychain / Linux Secret Service / Windows Credential Locker via the [`keyring`](https://pypi.org/project/keyring/) library; on Linux requires a running Secret Service provider such as gnome-keyring, KWallet, or KeePassXC), `plain`.
 
 ## Usage
 

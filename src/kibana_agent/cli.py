@@ -26,7 +26,8 @@ Profiles:
 
 Auth methods:
     1password  — reads user/pass from 1Password via `op` CLI
-    keychain   — reads from macOS Keychain (service + account)
+    keychain   — reads from OS keyring (macOS Keychain / Linux Secret Service /
+                 Windows Credential Locker) via the `keyring` library
     plain      — stored in config file (not recommended)
 
 Config:  ~/.config/kibana-agent/config.json
@@ -51,6 +52,8 @@ from typing import Any
 from urllib.parse import urlencode
 
 import click
+import keyring
+import keyring.errors
 import requests
 
 from kibana_agent.kql import kql_to_es
@@ -73,6 +76,12 @@ CACHE_TTL_CONTEXT = 3600
 _CRED_CACHE_SERVICE = "kibana-agent"
 _CRED_CACHE_TTL = 30 * 60  # 30 minutes
 _CRED_CACHE_KEYS = ("cache-username", "cache-password", "cache-ts")
+
+_KEYRING_HINT = (
+    "No OS keyring backend is available. On Linux, install and start a Secret "
+    "Service provider (e.g. gnome-keyring, KeePassXC, or KWallet), or use "
+    "`--auth 1password` / `--auth plain` instead."
+)
 
 BLOCKED_ENDPOINTS = {
     "_bulk",
@@ -138,40 +147,68 @@ def _get_profile(name: str | None = None) -> dict[str, Any]:
     return profile_data  # type: ignore[no-any-return]
 
 
+_IS_MACOS = sys.platform == "darwin"
+
+
 def _keychain_read(service: str, account: str) -> str | None:
+    if _IS_MACOS:
+        try:
+            return subprocess.run(
+                ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            return None
     try:
-        return subprocess.run(
-            ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return None
+        return keyring.get_password(service, account)
+    except keyring.errors.KeyringError as exc:
+        click.echo(f"Keyring error: {exc}", err=True)
+        click.echo(_KEYRING_HINT, err=True)
+        sys.exit(1)
 
 
 def _keychain_write(service: str, account: str, value: str) -> None:
-    subprocess.run(
-        ["security", "delete-generic-password", "-s", service, "-a", account],
-        capture_output=True,
-    )
-    subprocess.run(
-        ["security", "add-generic-password", "-s", service, "-a", account, "-w", value],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    if _IS_MACOS:
+        subprocess.run(
+            ["security", "delete-generic-password", "-s", service, "-a", account],
+            capture_output=True,
+        )
+        subprocess.run(
+            ["security", "add-generic-password", "-s", service, "-a", account, "-w", value],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return
+    try:
+        keyring.set_password(service, account, value)
+    except keyring.errors.KeyringError as exc:
+        click.echo(f"Keyring error: {exc}", err=True)
+        click.echo(_KEYRING_HINT, err=True)
+        sys.exit(1)
 
 
 def _keychain_delete(service: str, account: str) -> None:
-    subprocess.run(
-        ["security", "delete-generic-password", "-s", service, "-a", account],
-        capture_output=True,
-    )
+    if _IS_MACOS:
+        subprocess.run(
+            ["security", "delete-generic-password", "-s", service, "-a", account],
+            capture_output=True,
+        )
+        return
+    try:
+        keyring.delete_password(service, account)
+    except keyring.errors.PasswordDeleteError:
+        pass
+    except keyring.errors.KeyringError as exc:
+        click.echo(f"Keyring error: {exc}", err=True)
+        click.echo(_KEYRING_HINT, err=True)
+        sys.exit(1)
 
 
 def _cached_creds_get() -> tuple[str, str] | None:
-    """Read cached credentials from macOS Keychain if still within TTL."""
+    """Read cached credentials from the OS keyring if still within TTL."""
     timestamp = _keychain_read(_CRED_CACHE_SERVICE, "cache-ts")
     if not timestamp:
         return None
@@ -217,7 +254,7 @@ def _auth_1password(auth: dict[str, Any]) -> tuple[str, str]:
             if "promptError" in (exc.stderr or ""):
                 click.echo(
                     "Hint: run this command in a terminal that can show Touch ID.\n"
-                    "Credentials will be cached in macOS Keychain for 30 min.",
+                    "Credentials will be cached in the OS keyring for 30 min.",
                     err=True,
                 )
             sys.exit(1)
@@ -231,7 +268,7 @@ def _auth_keychain(auth: dict[str, Any]) -> tuple[str, str]:
     password = _keychain_read(service, auth["password_account"])
     if username is None or password is None:
         missing = "username" if username is None else "password"
-        click.echo(f"Keychain: {missing} not found for service='{service}'", err=True)
+        click.echo(f"Keyring: {missing} not found for service='{service}'", err=True)
         sys.exit(1)
     return username, password
 
@@ -641,11 +678,11 @@ def profile() -> None:
 )
 @click.option("--op-username", default=None, help="1Password ref for username")
 @click.option("--op-password", default=None, help="1Password ref for password")
-@click.option("--kc-service", default=None, help="Keychain service name")
-@click.option("--kc-username-account", default=None, help="Keychain account for username")
-@click.option("--kc-password-account", default=None, help="Keychain account for password")
-@click.option("--kc-set-username", default=None, help="Store this username in Keychain now")
-@click.option("--kc-set-password", default=None, help="Store this password in Keychain now")
+@click.option("--kc-service", default=None, help="OS keyring service name")
+@click.option("--kc-username-account", default=None, help="OS keyring account for username")
+@click.option("--kc-password-account", default=None, help="OS keyring account for password")
+@click.option("--kc-set-username", default=None, help="Store this username in the OS keyring now")
+@click.option("--kc-set-password", default=None, help="Store this password in the OS keyring now")
 @click.option("--username", default=None, help="Plain text username")
 @click.option("--password", default=None, help="Plain text password")
 @click.option("--space", default=None, help="Kibana Space ID (e.g. backend)")
@@ -687,7 +724,7 @@ def profile_create(
         --space backend --index logs-* --restrict-index --use
 
     \b
-      # macOS Keychain
+      # OS keyring (macOS Keychain / Linux Secret Service / Windows Credential Locker)
       profile create stg --url https://kibana-stg.example.com --auth keychain \\
         --kc-service kibana-stg --kc-username-account kibana-user \\
         --kc-password-account kibana-pass \\
@@ -724,13 +761,13 @@ def profile_create(
         if kc_set_username:
             _keychain_write(service, username_account, kc_set_username)
             click.echo(
-                f"Stored username in Keychain (service={service}, account={username_account})",
+                f"Stored username in OS keyring (service={service}, account={username_account})",
                 err=True,
             )
         if kc_set_password:
             _keychain_write(service, password_account, kc_set_password)
             click.echo(
-                f"Stored password in Keychain (service={service}, account={password_account})",
+                f"Stored password in OS keyring (service={service}, account={password_account})",
                 err=True,
             )
 
@@ -846,8 +883,8 @@ def profile_delete(name: str) -> None:
 @click.option("--kc-service", default=None)
 @click.option("--kc-username-account", default=None)
 @click.option("--kc-password-account", default=None)
-@click.option("--kc-set-username", default=None, help="Update username in Keychain")
-@click.option("--kc-set-password", default=None, help="Update password in Keychain")
+@click.option("--kc-set-username", default=None, help="Update username in the OS keyring")
+@click.option("--kc-set-password", default=None, help="Update password in the OS keyring")
 @click.option("--username", default=None)
 @click.option("--password", default=None)
 @click.option("--space", default=None, help="Kibana Space ID")
@@ -907,11 +944,11 @@ def profile_update(
         if kc_set_username:
             acct = auth.get("username_account", f"{name}-username")
             _keychain_write(service, acct, kc_set_username)
-            click.echo("Updated username in Keychain", err=True)
+            click.echo("Updated username in OS keyring", err=True)
         if kc_set_password:
             acct = auth.get("password_account", f"{name}-password")
             _keychain_write(service, acct, kc_set_password)
-            click.echo("Updated password in Keychain", err=True)
+            click.echo("Updated password in OS keyring", err=True)
     elif current_type == "plain":
         if username:
             auth["username"] = username
@@ -1397,10 +1434,10 @@ def raw(
 
 @cli.command("cache-clear")
 def cache_clear() -> None:
-    """Wipe all cached data (including Keychain credential cache)."""
+    """Wipe all cached data (including OS keyring credential cache)."""
     _cached_creds_clear()
     click.echo(f"Cleared {cache_clear_all()} files from {CACHE_DIR}")
-    click.echo("Cleared cached credentials from Keychain.")
+    click.echo("Cleared cached credentials from OS keyring.")
 
 
 @cli.command("agent-help")
