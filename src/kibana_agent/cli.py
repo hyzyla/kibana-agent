@@ -484,7 +484,7 @@ def _space_prefix(profile: dict[str, Any]) -> str:
 
 
 def _resolve_index(profile: dict[str, Any], index_pattern: str | None) -> str:
-    default_index = profile.get("index")
+    default_index: str | None = profile.get("index")
     if index_pattern is not None:
         if profile.get("restrict_index") and default_index and index_pattern != default_index:
             click.echo(
