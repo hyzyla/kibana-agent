@@ -30,8 +30,12 @@ Auth methods:
                  Windows Credential Locker) via the `keyring` library
     plain      — stored in config file (not recommended)
 
-Config:  ~/.config/kibana-agent/config.json
-Cache:   ~/.cache/kibana-agent/
+Config:  $KIBANA_AGENT_CONFIG_DIR, or
+         $XDG_CONFIG_HOME/kibana-agent (default ~/.config/kibana-agent) on Linux/macOS
+         %APPDATA%\\kibana-agent on Windows
+Cache:   $KIBANA_AGENT_CACHE_DIR, or
+         $XDG_CACHE_HOME/kibana-agent (default ~/.cache/kibana-agent) on Linux/macOS
+         %LOCALAPPDATA%\\kibana-agent\\Cache on Windows
 """
 
 from __future__ import annotations
@@ -58,9 +62,47 @@ import requests
 
 from kibana_agent.kql import kql_to_es
 
-CONFIG_DIR = Path.home() / ".config" / "kibana-agent"
+
+def _resolve_dir(
+    env_override: str,
+    xdg_var: str,
+    win_var: str,
+    win_subdir: str,
+    unix_default: Path,
+) -> Path:
+    """Resolve a per-user directory: env override → platform default."""
+    override = os.environ.get(env_override)
+    if override:
+        return Path(override).expanduser()
+    if sys.platform == "win32":
+        base = os.environ.get(win_var)
+        if not base:
+            base = str(
+                Path.home() / "AppData" / ("Local" if win_subdir else "Roaming")
+            )
+        path = Path(base) / "kibana-agent"
+        return path / win_subdir if win_subdir else path
+    xdg = os.environ.get(xdg_var)
+    if xdg:
+        return Path(xdg) / "kibana-agent"
+    return unix_default
+
+
+CONFIG_DIR = _resolve_dir(
+    "KIBANA_AGENT_CONFIG_DIR",
+    "XDG_CONFIG_HOME",
+    "APPDATA",
+    "",
+    Path.home() / ".config" / "kibana-agent",
+)
 CONFIG_FILE = CONFIG_DIR / "config.json"
-CACHE_DIR = Path.home() / ".cache" / "kibana-agent"
+CACHE_DIR = _resolve_dir(
+    "KIBANA_AGENT_CACHE_DIR",
+    "XDG_CACHE_HOME",
+    "LOCALAPPDATA",
+    "Cache",
+    Path.home() / ".cache" / "kibana-agent",
+)
 
 DEFAULT_TIME_RANGE = "1h"
 DEFAULT_SIZE = 5
