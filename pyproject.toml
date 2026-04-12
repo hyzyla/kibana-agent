@@ -1,6 +1,6 @@
 [project]
 name = "kibana-agent"
-version = "0.5.0"
+version = "0.6.0"
 description = "Read-only Kibana/Elasticsearch CLI optimised for AI agent usage"
 readme = "README.md"
 authors = [
@@ -20,6 +20,7 @@ dependencies = [
     "requests>=2.31",
     "click>=8.1",
     "keyring>=25.0",
+    "mcp>=1.0",
 ]
 
 [project.urls]

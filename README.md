@@ -44,6 +44,10 @@ usage reference.
 
 Output is JSON. All operations are read-only.
 
+## MCP server
+
+The same operations are also available as an MCP server (`kibana-agent mcp`) for use with Claude Code, Claude Desktop, Cursor, etc. Profiles and credentials are shared with the CLI.
+
 ## License
 
 MIT

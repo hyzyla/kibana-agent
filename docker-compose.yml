@@ -1,0 +1,101 @@
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
+    environment:
+      - discovery.type=single-node
+      - ELASTIC_PASSWORD=changeme
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=false
+      - xpack.security.transport.ssl.enabled=false
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "curl -sf -u elastic:changeme http://localhost:9200/_cluster/health | grep -q '\"status\":\"\\(green\\|yellow\\)\"'"
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # Kibana 8.x forbids using the `elastic` superuser as its server identity,
+  # so this one-shot container resets the built-in `kibana_system` password
+  # to `changeme` before Kibana starts.
+  kibana-setup:
+    image: curlimages/curl:8.7.1
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        curl -sf -u elastic:changeme -X POST \
+          -H "Content-Type: application/json" \
+          http://elasticsearch:9200/_security/user/kibana_system/_password \
+          -d '{"password":"changeme"}' \
+          && echo "kibana_system password set"
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.13.4
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=changeme
+      - XPACK_SECURITY_ENCRYPTIONKEY=kibana_agent_local_dev_key_32chars_min
+      - XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY=kibana_agent_local_dev_key_32chars_min
+      - XPACK_REPORTING_ENCRYPTIONKEY=kibana_agent_local_dev_key_32chars_min
+    ports:
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+      kibana-setup:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "curl -sf http://localhost:5601/api/status | grep -q '\"level\":\"available\"'"
+      interval: 5s
+      timeout: 10s
+      retries: 60
+
+  seed:
+    image: curlimages/curl:8.7.1
+    depends_on:
+      kibana:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        for ds in logs ecommerce flights; do
+          echo "Loading sample dataset: $$ds"
+          curl -s -u elastic:changeme -X POST \
+            -H "kbn-xsrf: true" \
+            "http://kibana:5601/api/sample_data/$$ds" \
+            -o /dev/null -w "  http %{http_code}\n" || true
+        done
+        echo ""
+        echo "================================================"
+        echo "  Local Kibana ready"
+        echo "================================================"
+        echo "  Kibana:   http://localhost:5601"
+        echo "  ES:       http://localhost:9200"
+        echo "  Username: elastic"
+        echo "  Password: changeme"
+        echo ""
+        echo "  Point kibana-agent at it:"
+        echo "    export KIBANA_URL=http://localhost:5601"
+        echo "    export KIBANA_USERNAME=elastic"
+        echo "    export KIBANA_PASSWORD=changeme"
+        echo ""
+        echo "  Seeded indices:"
+        echo "    kibana_sample_data_logs"
+        echo "    kibana_sample_data_ecommerce"
+        echo "    kibana_sample_data_flights"
+        echo "================================================"
+
+volumes:
+  es_data:

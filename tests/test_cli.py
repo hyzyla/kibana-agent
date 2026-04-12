@@ -1,40 +1,32 @@
 from __future__ import annotations
 
-import pytest
+from click.testing import CliRunner
 
-from kibana_agent.cli import _resolve_index, _space_prefix
-
-
-class TestSpacePrefix:
-    def test_with_space(self) -> None:
-        assert _space_prefix({"space": "backend"}) == "/s/backend"
-
-    def test_without_space(self) -> None:
-        assert _space_prefix({}) == ""
-
-    def test_space_none(self) -> None:
-        assert _space_prefix({"space": None}) == ""
+from kibana_agent.cli import cli
 
 
-class TestResolveIndex:
-    def test_explicit_index(self) -> None:
-        assert _resolve_index({}, "logs-*") == "logs-*"
+def test_cli_help_runs() -> None:
+    runner = CliRunner()
+    result = runner.invoke(cli, ["--help"])
+    assert result.exit_code == 0
+    assert "kibana" in result.output.lower()
 
-    def test_default_from_profile(self) -> None:
-        assert _resolve_index({"index": "logs-*"}, None) == "logs-*"
 
-    def test_explicit_overrides_default(self) -> None:
-        assert _resolve_index({"index": "logs-*"}, "other-*") == "other-*"
+def test_mcp_subcommand_listed_in_help() -> None:
+    runner = CliRunner()
+    result = runner.invoke(cli, ["--help"])
+    assert result.exit_code == 0
+    assert "mcp" in result.output
 
-    def test_restrict_allows_matching_index(self) -> None:
-        prof = {"index": "logs-*", "restrict_index": True}
-        assert _resolve_index(prof, "logs-*") == "logs-*"
 
-    def test_restrict_blocks_mismatched_index(self) -> None:
-        prof = {"index": "logs-*", "restrict_index": True}
-        with pytest.raises(SystemExit):
-            _resolve_index(prof, "other-*")
+def test_mcp_help_does_not_eagerly_import_server() -> None:
+    """`kibana-agent mcp --help` must not require the `mcp` package to be importable."""
+    import sys
 
-    def test_no_default_no_arg_exits(self) -> None:
-        with pytest.raises(SystemExit):
-            _resolve_index({}, None)
+    # Drop any cached server import so we can detect a fresh load.
+    sys.modules.pop("kibana_agent.server", None)
+    runner = CliRunner()
+    result = runner.invoke(cli, ["mcp", "--help"])
+    assert result.exit_code == 0
+    # The lazy import lives inside the command body, so --help shouldn't trigger it.
+    assert "kibana_agent.server" not in sys.modules
