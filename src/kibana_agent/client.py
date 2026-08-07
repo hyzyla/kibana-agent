@@ -17,6 +17,7 @@ import contextlib
 import difflib
 import fnmatch
 import hashlib
+import importlib.metadata
 import json
 import os
 import re
@@ -85,6 +86,11 @@ CACHE_TTL_ALIASES = 86400
 CACHE_TTL_MAPPING = 86400
 CACHE_TTL_CONTEXT = 86400
 
+try:
+    CACHE_VERSION = importlib.metadata.version("kibana-agent")
+except importlib.metadata.PackageNotFoundError:  # source checkout, not installed
+    CACHE_VERSION = "dev"
+
 _CRED_CACHE_SERVICE = "kibana-agent"
 _CRED_CACHE_TTL_DEFAULT = 24 * 3600  # 24 hours
 _CRED_CACHE_TTL_ENV = "KIBANA_AGENT_CRED_CACHE_TTL"
@@ -124,6 +130,14 @@ _AGGREGATABLE_TYPES = (
     )
 )
 _TIME_FIELD_PREFERENCE = ("@timestamp", "timestamp", "time", "event.created", "event.ingested")
+_EXPAND_JSON_DEPTH = 4
+_PREFIX_GROUP_MIN = 6
+_DATED_INDEX = re.compile(r"^(?P<stem>.+?)-(?:\d{4}[.\-]\d{2}|\d{4,})[.\-\d]*$")
+_CAPPED_TOTAL_HINT = (
+    "total={total} is a floor, not the real count: Elasticsearch stops counting "
+    "at 10,000. Use `count` for an exact number, or `histogram`, whose bucket "
+    "counts are exact."
+)
 
 PROFILE_NAME_KEY = "_name"
 
@@ -515,6 +529,8 @@ def cache_get(profile: dict[str, Any], name: str, ttl: int) -> Any | None:
         data = json.loads(path.read_text())
     except (json.JSONDecodeError, OSError):
         return None
+    if data.get("_v") != CACHE_VERSION:
+        return None
     if time.time() - data.get("_t", 0) > ttl:
         return None
     return data.get("_p")
@@ -522,7 +538,8 @@ def cache_get(profile: dict[str, Any], name: str, ttl: int) -> Any | None:
 
 def cache_put(profile: dict[str, Any], name: str, payload: Any) -> None:
     path = _cache_path(profile, name)
-    path.write_text(json.dumps({"_t": time.time(), "_p": payload}, ensure_ascii=False))
+    envelope = {"_t": time.time(), "_v": CACHE_VERSION, "_p": payload}
+    path.write_text(json.dumps(envelope, ensure_ascii=False))
 
 
 def _clear_dir(root: Path) -> int:
@@ -809,7 +826,35 @@ def _pluck(source: dict[str, Any], path: str) -> Any:
     return current
 
 
-def _format_hit(hit: dict[str, Any], field_list: list[str] | None) -> dict[str, Any]:
+def _expand_json_strings(value: Any, depth: int = _EXPAND_JSON_DEPTH) -> Any:
+    """
+    Turn strings that hold a JSON document into real objects, and split
+    multi-line strings into a list of lines. Applications often log one JSON
+    payload into a single string field, and a traceback inside it stays
+    unreadable while it is escaped.
+    """
+    if isinstance(value, dict):
+        return {key: _expand_json_strings(item, depth) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_expand_json_strings(item, depth) for item in value]
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if depth > 0 and stripped[:1] in ("{", "["):
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            pass
+        else:
+            return _expand_json_strings(parsed, depth - 1)
+    if "\n" in value:
+        return value.rstrip("\n").split("\n")
+    return value
+
+
+def _format_hit(
+    hit: dict[str, Any], field_list: list[str] | None, expand_json: bool
+) -> dict[str, Any]:
     source = hit.get("_source", {})
     if field_list:
         picked = {}
@@ -819,24 +864,35 @@ def _format_hit(hit: dict[str, Any], field_list: list[str] | None) -> dict[str, 
                 picked[path] = value
         source = picked
     out = _strip_empty(source)
+    if expand_json:
+        out = _expand_json_strings(out)
     if hit.get("sort"):
         out["_sort"] = hit["sort"]
     return out
 
 
-def _format_search_result(
-    data: dict[str, Any], field_list: list[str] | None, max_source_len: int
-) -> dict[str, Any]:
-    total = data.get("hits", {}).get("total", {})
+def _read_total(total: Any) -> tuple[Any, bool]:
+    """
+    Read "hits.total" and say whether the number is only a floor.
+    Elasticsearch stops counting at 10,000 by default and then reports
+    "relation": "gte", so the value means "at least this many".
+    """
     if isinstance(total, dict):
-        total = total.get("value", "?")
+        return total.get("value", "?"), total.get("relation") == "gte"
+    return total, False
+
+
+def _format_search_result(
+    data: dict[str, Any], field_list: list[str] | None, max_source_len: int, expand_json: bool
+) -> dict[str, Any]:
+    total, capped = _read_total(data.get("hits", {}).get("total", {}))
     raw_hits = data.get("hits", {}).get("hits", [])
     truncated = len(raw_hits) > MAX_RESPONSE_HITS
     limited_hits = raw_hits[:MAX_RESPONSE_HITS] if truncated else raw_hits
     hits = []
     cut = 0
     for hit in limited_hits:
-        formatted = _format_hit(hit, field_list)
+        formatted = _format_hit(hit, field_list, expand_json)
         serialized = json.dumps(formatted, ensure_ascii=False, separators=(",", ":"))
         if max_source_len and len(serialized) > max_source_len:
             hits.append({"_truncated": serialized[:max_source_len] + "…"})
@@ -849,6 +905,9 @@ def _format_search_result(
             f"{max_source_len}. Raise it, or select the fields you need with -f."
         )
     result: dict[str, Any] = {"total": total, "n": len(hits)}
+    if capped:
+        result["total_is_lower_bound"] = True
+        warn(_CAPPED_TOTAL_HINT.format(total=total))
     if truncated:
         result["truncated"] = len(raw_hits)
     result["hits"] = hits
@@ -1044,13 +1103,42 @@ def _parse_aliases(data: dict[str, Any]) -> dict[str, list[str]]:
     return alias_map
 
 
+def _group_by_common_prefix(names: list[str]) -> list[str]:
+    """
+    Collapse many sibling indices into one wildcard, the same rule that
+    "aliases" applies. Names are grouped by everything before the last "-".
+    """
+    groups: dict[str, list[str]] = {}
+    for name in names:
+        head, separator, _ = name.rpartition("-")
+        groups.setdefault(head if separator else name, []).append(name)
+    out: list[str] = []
+    for members in groups.values():
+        if len(members) >= _PREFIX_GROUP_MIN:
+            out.append(f"{os.path.commonprefix(members)}*")
+        else:
+            out.extend(members)
+    return out
+
+
 def _extract_prefixes(raw: dict[str, Any]) -> list[str]:
+    """
+    Reduce a list of index names to the patterns you can query.
+    A date suffix ("-2026.08.07") or a sequence suffix ("-000397") becomes "-*".
+    Whatever is left is grouped by common prefix, so an unknown naming scheme
+    cannot make this list long again.
+    """
     prefixes: set[str] = set()
+    plain: list[str] = []
     for index_name in raw:
         if index_name.startswith("."):
             continue
-        parts = re.split(r"-\d{4}[.\-]", index_name)
-        prefixes.add(parts[0] + "-*" if len(parts) > 1 else index_name)
+        match = _DATED_INDEX.match(index_name)
+        if match:
+            prefixes.add(f"{match.group('stem')}-*")
+        else:
+            plain.append(index_name)
+    prefixes.update(_group_by_common_prefix(plain))
     return sorted(prefixes)
 
 
@@ -1240,8 +1328,9 @@ def _pattern_stats(
         return stats
     if not isinstance(data, dict):
         return stats
-    total = data.get("hits", {}).get("total", {})
-    stats["docs"] = total.get("value") if isinstance(total, dict) else total
+    stats["docs"], capped = _read_total(data.get("hits", {}).get("total", {}))
+    if capped:
+        stats["docs_is_lower_bound"] = True
     aggs = data.get("aggregations", {})
     for key in ("first", "last"):
         value = aggs.get(key, {}).get("value_as_string")
@@ -1293,6 +1382,7 @@ def op_search(
     fields: list[str] | None = None,
     aggs: dict[str, Any] | None = None,
     max_source_len: int = MAX_SOURCE_LEN,
+    expand_json: bool = False,
     time_field: str = DEFAULT_TIME_FIELD,
     hints: bool = True,
     **es_kwargs: Any,
@@ -1311,7 +1401,7 @@ def op_search(
     if hints:
         check_request(profile, index_pattern, body["query"], aggs, time_field, **es_kwargs)
     data = es(profile, "POST", f"{index_pattern}/_search", body, **es_kwargs)
-    result = _format_search_result(data, fields, max_source_len)  # type: ignore[arg-type]
+    result = _format_search_result(data, fields, max_source_len, expand_json)  # type: ignore[arg-type]
     if hints and result["total"] == 0 and (extra_query or kql):
         diagnose_zero(profile, index_pattern, time_range, time_field, **es_kwargs)
     return result
@@ -1371,14 +1461,16 @@ def op_histogram(
         )
     data = es(profile, "POST", f"{index_pattern}/_search", body, **es_kwargs)
     buckets = data.get("aggregations", {}).get("t", {}).get("buckets", [])  # type: ignore[union-attr]
-    total = data.get("hits", {}).get("total", {})  # type: ignore[union-attr]
-    if isinstance(total, dict):
-        total = total.get("value", "?")
-    return {
-        "total": total,
-        "interval": interval,
-        "buckets": [{"t": b["key_as_string"], "n": b["doc_count"]} for b in buckets],
-    }
+    total, capped = _read_total(data.get("hits", {}).get("total", {}))  # type: ignore[union-attr]
+    result: dict[str, Any] = {"total": total, "interval": interval}
+    if capped:
+        result["total_is_lower_bound"] = True
+        warn(
+            f"total={total} is a floor: Elasticsearch stops counting at 10,000. "
+            f"The bucket counts below are exact — sum them for the real total."
+        )
+    result["buckets"] = [{"t": b["key_as_string"], "n": b["doc_count"]} for b in buckets]
+    return result
 
 
 def op_context(
@@ -1492,6 +1584,7 @@ def op_tail_page(
     size: int = 50,
     fields: list[str] | None = None,
     max_source_len: int = MAX_SOURCE_LEN,
+    expand_json: bool = False,
     **es_kwargs: Any,
 ) -> dict[str, Any]:
     """Fetch one page of new logs using ``search_after``.
@@ -1520,7 +1613,7 @@ def op_tail_page(
     raw_hits = data.get("hits", {}).get("hits", [])  # type: ignore[union-attr]
     formatted_hits: list[dict[str, Any]] = []
     for hit in raw_hits:
-        formatted = _format_hit(hit, fields)
+        formatted = _format_hit(hit, fields, expand_json)
         serialized = json.dumps(formatted, ensure_ascii=False, separators=(",", ":"))
         if max_source_len and len(serialized) > max_source_len:
             formatted_hits.append({"_truncated": serialized[:max_source_len] + "…"})

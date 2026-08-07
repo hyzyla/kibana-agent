@@ -682,6 +682,14 @@ def count(
 @click.option("--aggs", default=None)
 @click.option("--time-field", "time_field", default=DEFAULT_TIME_FIELD)
 @click.option("--max-source-len", "max_source_len", default=MAX_SOURCE_LEN, type=int)
+@click.option(
+    "--expand-json",
+    "expand_json",
+    is_flag=True,
+    default=False,
+    help="Parse JSON held inside string fields and split multi-line strings into lines. "
+    "Use it with --format pretty to read a traceback.",
+)
 @click.option("--no-hints", "no_hints", is_flag=True, default=False)
 @common
 @handle_errors
@@ -696,6 +704,7 @@ def search(
     aggs: str | None,
     time_field: str,
     max_source_len: int,
+    expand_json: bool,
     no_hints: bool,
     prof_name: str | None,
     timeout: int,
@@ -720,6 +729,7 @@ def search(
         fields=field_list,
         aggs=json.loads(aggs) if aggs else None,
         max_source_len=max_source_len,
+        expand_json=expand_json,
         time_field=time_field,
         hints=not no_hints and not dry_run,
         **_es_kwargs(timeout, dry_run, explain, filter_path),
@@ -736,6 +746,13 @@ def search(
 @click.option("-f", "--fields", "field_csv", default=None)
 @click.option("-n", "--size", default=50, type=int)
 @click.option("--max-source-len", "max_source_len", default=MAX_SOURCE_LEN, type=int)
+@click.option(
+    "--expand-json",
+    "expand_json",
+    is_flag=True,
+    default=False,
+    help="Parse JSON held inside string fields and split multi-line strings into lines.",
+)
 @common
 @handle_errors
 def tail(
@@ -747,6 +764,7 @@ def tail(
     field_csv: str | None,
     size: int,
     max_source_len: int,
+    expand_json: bool,
     prof_name: str | None,
     timeout: int,
     dry_run: bool,
@@ -780,6 +798,7 @@ def tail(
                 size=size,
                 fields=field_list,
                 max_source_len=max_source_len,
+                expand_json=expand_json,
                 **_es_kwargs(timeout, dry_run, explain and first, filter_path),
             )
         except DryRunResult:
@@ -1022,6 +1041,9 @@ All write operations are blocked. Safe to use in automated pipelines.
    - `-f <fields>` — comma-separated source fields to return
    - `--sort <field>:<order>` — sort order (default: @timestamp:desc)
    - `--aggs <json>` — aggregation clause
+   - `--expand-json` — parse JSON that the application logged into a string
+     field, and split multi-line strings into lines. Use it with
+     `--format pretty` to read a traceback.
 
 3. Count documents with `kibana-agent count <index-pattern>`:
    - Same --last and -q options as search.
@@ -1095,6 +1117,15 @@ After the request:
   - documents cut at `--max-source-len`, which names the flag to raise.
 
 A zero with no note and a clean exit is a real zero.
+
+## `total` can be a floor, not a count
+
+Elasticsearch stops counting matches at 10,000. When it does, `search` and
+`histogram` add `"total_is_lower_bound": true` and warn on stderr. The real
+number is higher — never report such a `total` as a fact. For an exact number
+use `count`, which uses the `_count` API, or sum the `histogram` buckets,
+which are aggregation counts and always exact. `context` marks the same case
+with `"docs_is_lower_bound": true`.
 
 ## Output format
 

@@ -62,6 +62,7 @@ def search_logs(
     fields: list[str] | None = None,
     sort: str | None = None,
     aggs: dict[str, Any] | None = None,
+    expand_json: bool = False,
     time_field: str = "@timestamp",
     profile: str | None = None,
 ) -> dict[str, Any]:
@@ -71,6 +72,11 @@ def search_logs(
     via the ``query`` parameter (a JSON string of an ES query clause). Returns
     ``{total, n, hits, ...}``. ``index_pattern`` defaults to the profile's
     configured default index.
+
+    ``total`` is a floor when ``total_is_lower_bound`` is present: Elasticsearch
+    stops counting at 10,000. Set ``expand_json`` to parse JSON that an
+    application logged into a string field, and to split multi-line strings
+    such as tracebacks into a list of lines.
     """
     prof = _resolve(profile)
     idx = client._resolve_index(prof, index_pattern)
@@ -84,6 +90,7 @@ def search_logs(
         sort=sort,
         fields=fields,
         aggs=aggs,
+        expand_json=expand_json,
         time_field=time_field,
     )
 
@@ -193,6 +200,7 @@ def tail_logs(
     kql: str | None = None,
     size: int = 50,
     fields: list[str] | None = None,
+    expand_json: bool = False,
     profile: str | None = None,
 ) -> dict[str, Any]:
     """Poll for new logs since a cursor (uses ``search_after``).
@@ -213,6 +221,7 @@ def tail_logs(
         kql=kql,
         size=size,
         fields=fields,
+        expand_json=expand_json,
     )
 
 

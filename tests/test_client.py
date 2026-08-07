@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import pytest
@@ -524,12 +525,12 @@ class TestPluck:
 class TestFormatHitNestedFields:
     def test_selects_nested_fields(self) -> None:
         hit = {"_source": {"@timestamp": "t", "logs": {"message": "hi", "level": "ERROR"}}}
-        out = client._format_hit(hit, ["@timestamp", "logs.message"])
+        out = client._format_hit(hit, ["@timestamp", "logs.message"], False)
         assert out == {"@timestamp": "t", "logs.message": "hi"}
 
     def test_missing_field_is_omitted(self) -> None:
         hit = {"_source": {"@timestamp": "t", "logs": {"message": "hi"}}}
-        assert client._format_hit(hit, ["@timestamp", "logs.absent"]) == {"@timestamp": "t"}
+        assert client._format_hit(hit, ["@timestamp", "logs.absent"], False) == {"@timestamp": "t"}
 
 
 class TestFlattenPropertiesMultiFields:
@@ -787,3 +788,101 @@ class TestCredCacheTtl:
         monkeypatch.setattr(client, "keychain_write", lambda *a: written.append(a))
         client._cached_creds_put({"_name": "prd"}, "u", "p")
         assert written == []
+
+
+class TestExtractPrefixes:
+    def test_collapses_date_suffix(self) -> None:
+        raw = {"logs-2026.08.06": {}, "logs-2026.08.07": {}}
+        assert client._extract_prefixes(raw) == ["logs-*"]
+
+    def test_collapses_dashed_date_suffix(self) -> None:
+        raw = {"alb-logs-d-2026-08-06": {}, "alb-logs-d-2026-08-07": {}}
+        assert client._extract_prefixes(raw) == ["alb-logs-d-*"]
+
+    def test_collapses_sequence_suffix(self) -> None:
+        raw = {f"k8s-edo-{n:06d}": {} for n in range(390, 400)}
+        assert client._extract_prefixes(raw) == ["k8s-edo-*"]
+
+    def test_skips_system_indices(self) -> None:
+        assert client._extract_prefixes({".kibana-1": {}, "logs-2026.08.07": {}}) == ["logs-*"]
+
+    def test_keeps_a_plain_name_whole(self) -> None:
+        assert client._extract_prefixes({"metrics": {}}) == ["metrics"]
+
+    def test_groups_many_siblings_by_common_prefix(self) -> None:
+        raw = {f"app-shard-{letter}": {} for letter in "abcdefgh"}
+        assert client._extract_prefixes(raw) == ["app-shard-*"]
+
+    def test_keeps_a_few_siblings_apart(self) -> None:
+        raw = {"app-web": {}, "app-api": {}}
+        assert client._extract_prefixes(raw) == ["app-api", "app-web"]
+
+
+class TestReadTotal:
+    def test_exact_total(self) -> None:
+        assert client._read_total({"value": 806, "relation": "eq"}) == (806, False)
+
+    def test_capped_total(self) -> None:
+        assert client._read_total({"value": 10000, "relation": "gte"}) == (10000, True)
+
+    def test_plain_number(self) -> None:
+        assert client._read_total(42) == (42, False)
+
+    def test_search_result_flags_a_capped_total(self) -> None:
+        data = {"hits": {"total": {"value": 10000, "relation": "gte"}, "hits": []}}
+        result = client._format_search_result(data, None, 1000, False)
+        assert result["total"] == 10000
+        assert result["total_is_lower_bound"] is True
+
+    def test_search_result_leaves_an_exact_total_unflagged(self) -> None:
+        data = {"hits": {"total": {"value": 12, "relation": "eq"}, "hits": []}}
+        result = client._format_search_result(data, None, 1000, False)
+        assert "total_is_lower_bound" not in result
+
+
+class TestExpandJsonStrings:
+    def test_parses_json_held_in_a_string(self) -> None:
+        out = client._expand_json_strings({"raw_log": '{"level":"ERROR","n":1}'})
+        assert out == {"raw_log": {"level": "ERROR", "n": 1}}
+
+    def test_parses_json_nested_two_deep(self) -> None:
+        inner = json.dumps({"tb": "line1\nline2"})
+        out = client._expand_json_strings({"raw_log": json.dumps({"exc": inner})})
+        assert out == {"raw_log": {"exc": {"tb": ["line1", "line2"]}}}
+
+    def test_splits_a_multiline_string(self) -> None:
+        assert client._expand_json_strings({"tb": "a\nb\n"}) == {"tb": ["a", "b"]}
+
+    def test_leaves_a_plain_string_alone(self) -> None:
+        assert client._expand_json_strings({"msg": "hello"}) == {"msg": "hello"}
+
+    def test_leaves_broken_json_alone(self) -> None:
+        assert client._expand_json_strings({"msg": "{not json"}) == {"msg": "{not json"}
+
+    def test_format_hit_expands_only_when_asked(self) -> None:
+        hit = {"_source": {"raw_log": '{"a":1}'}}
+        assert client._format_hit(hit, None, False) == {"raw_log": '{"a":1}'}
+        assert client._format_hit(hit, None, True) == {"raw_log": {"a": 1}}
+
+
+class TestCacheVersionStamp:
+    def test_round_trip(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        monkeypatch.setattr(client, "CACHE_DIR", tmp_path)
+        client.cache_put({"_name": "prd"}, "ctx", {"a": 1})
+        assert client.cache_get({"_name": "prd"}, "ctx", 3600) == {"a": 1}
+
+    def test_payload_from_another_version_is_ignored(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        monkeypatch.setattr(client, "CACHE_DIR", tmp_path)
+        client.cache_put({"_name": "prd"}, "ctx", {"a": 1})
+        monkeypatch.setattr(client, "CACHE_VERSION", "9.9.9")
+        assert client.cache_get({"_name": "prd"}, "ctx", 3600) is None
+
+    def test_envelope_without_a_version_is_ignored(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        monkeypatch.setattr(client, "CACHE_DIR", tmp_path)
+        path = client._cache_path({"_name": "prd"}, "ctx")
+        path.write_text(json.dumps({"_t": time.time(), "_p": {"a": 1}}))
+        assert client.cache_get({"_name": "prd"}, "ctx", 3600) is None

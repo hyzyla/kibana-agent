@@ -87,6 +87,18 @@ kibana-agent agent-help
    does not contain is left out. Without `-f` you get the whole document, truncated at
    `--max-source-len` characters (default 1000) — raise it when a long document gets cut.
 
+   Applications often log a whole JSON document into one string field. A traceback inside such a
+   field arrives escaped several layers deep and is unreadable. `--expand-json` parses those
+   strings back into objects and splits multi-line strings into a list of lines:
+
+   ```bash
+   kibana-agent search <index-pattern> --last 1h -n 1 -q '<query>' \
+     --expand-json --format pretty --max-source-len 6000
+   ```
+
+   Use it whenever you need to read an exception. Without it, do not try to unescape the output by
+   hand.
+
 4. **Spot trends**:
    ```bash
    kibana-agent histogram <index-pattern> --last 6h --interval 10m
@@ -139,6 +151,24 @@ was printed.
 
 A partial result also prints a warning: `N of M shards failed`. The counts in that response are
 incomplete, so do not report them as totals.
+
+## Never Trust a `total` of 10000 Either
+
+Elasticsearch stops counting matches at 10,000. When it does, `search` and `histogram` return
+`"total_is_lower_bound": true` and warn on stderr. The value means "at least 10,000", so a
+`total` of exactly 10000 is almost never the real number.
+
+```
+Warning: total=10000 is a floor, not the real count: Elasticsearch stops counting at 10,000.
+#{"total":10000,"n":3,"total_is_lower_bound":true}
+```
+
+Reporting that as "10,000 errors" is a wrong answer, not a visible failure. For an exact number:
+
+- `kibana-agent count <index-pattern>` — uses the `_count` API, which always counts everything;
+- or sum the `histogram` buckets — aggregation counts are exact at any size.
+
+`context` marks the same case per pattern with `"docs_is_lower_bound": true`.
 
 ## Match the Query to the Field Type
 
