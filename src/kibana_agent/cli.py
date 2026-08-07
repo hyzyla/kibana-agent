@@ -948,6 +948,44 @@ def cache_clear(prof_name: str | None, clear_all: bool, data_only: bool, creds_o
         click.echo(f"Cleared cached credentials for '{label}'.")
 
 
+@cli.command("cred-cache-ttl")
+@click.argument("seconds", required=False, default=None)
+@handle_errors
+def cred_cache_ttl_cmd(seconds: str | None) -> None:
+    """
+    Show or set how long 1Password/keychain credentials stay cached.
+
+    \b
+    Examples:
+      cred-cache-ttl              # show the current value and where it comes from
+      cred-cache-ttl 3600         # cache for one hour
+      cred-cache-ttl 0            # disable caching (authenticate every call)
+      cred-cache-ttl unset        # drop the override and use the default
+
+    KIBANA_AGENT_CRED_CACHE_TTL overrides the stored value for one shell.
+    """
+    if seconds is None:
+        click.echo(f"cred_cache_ttl: {client.cred_cache_ttl()}s ({client.cred_cache_ttl_source()})")
+        return
+
+    if seconds.lower() in ("unset", "default", "clear"):
+        client.set_cred_cache_ttl(None)
+        default = client._CRED_CACHE_TTL_DEFAULT
+        click.echo(f"cred_cache_ttl: unset (default {default}s = {default // 3600}h)")
+        return
+
+    try:
+        value = int(seconds)
+    except ValueError:
+        click.echo(f"Error: '{seconds}' is not an integer number of seconds.", err=True)
+        sys.exit(1)
+    if value < 0:
+        click.echo("Error: TTL must be >= 0 (0 disables caching).", err=True)
+        sys.exit(1)
+    client.set_cred_cache_ttl(value)
+    click.echo(f"cred_cache_ttl: {value}s" + (" (caching disabled)" if value == 0 else ""))
+
+
 @cli.command()
 def mcp() -> None:
     """Run the MCP server (stdio transport).
@@ -1012,6 +1050,9 @@ All write operations are blocked. Safe to use in automated pipelines.
   profile. `--profile <name>` targets another, `--all` covers every profile,
   `--creds-only` re-authenticates but keeps the cached mappings, `--data-only`
   does the opposite. Profile notes are never touched.
+- `kibana-agent cred-cache-ttl [<seconds>]` — show or set how long 1Password /
+  keychain credentials stay cached. Default 24h; `0` disables caching, `unset`
+  removes the override. `KIBANA_AGENT_CRED_CACHE_TTL` overrides it per shell.
 - `kibana-agent mcp` — run as an MCP stdio server (Claude Code, Cursor, ...).
 
 ## Typical agent workflow

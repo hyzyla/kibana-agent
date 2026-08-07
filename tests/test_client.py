@@ -721,3 +721,69 @@ class TestProfileScopedCaches:
             (directory / "aliases.json").write_text("{}")
         assert client.cache_clear_profile({"_name": "one"}) == 1
         assert (tmp_path / "two" / "aliases.json").exists()
+
+
+class TestCredCacheTtl:
+    def _isolate(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        monkeypatch.setattr(client, "CONFIG_FILE", tmp_path / "config.json")
+        monkeypatch.setattr(client, "CONFIG_DIR", tmp_path)
+        monkeypatch.delenv("KIBANA_AGENT_CRED_CACHE_TTL", raising=False)
+
+    def test_default_when_nothing_is_set(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        self._isolate(monkeypatch, tmp_path)
+        assert client.cred_cache_ttl() == client._CRED_CACHE_TTL_DEFAULT
+        assert client.cred_cache_ttl_source() == "default"
+
+    def test_config_value_is_used(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        self._isolate(monkeypatch, tmp_path)
+        client.set_cred_cache_ttl(60)
+        assert client.cred_cache_ttl() == 60
+        assert client.cred_cache_ttl_source() == "config"
+
+    def test_env_overrides_config(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        self._isolate(monkeypatch, tmp_path)
+        client.set_cred_cache_ttl(60)
+        monkeypatch.setenv("KIBANA_AGENT_CRED_CACHE_TTL", "5")
+        assert client.cred_cache_ttl() == 5
+        assert "env" in client.cred_cache_ttl_source()
+
+    def test_unset_restores_the_default(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        self._isolate(monkeypatch, tmp_path)
+        client.set_cred_cache_ttl(60)
+        client.set_cred_cache_ttl(None)
+        assert client.cred_cache_ttl() == client._CRED_CACHE_TTL_DEFAULT
+
+    def test_garbage_falls_back_to_the_default(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        self._isolate(monkeypatch, tmp_path)
+        monkeypatch.setenv("KIBANA_AGENT_CRED_CACHE_TTL", "soon")
+        assert client.cred_cache_ttl() == client._CRED_CACHE_TTL_DEFAULT
+
+    def test_zero_disables_reading_the_cache(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        self._isolate(monkeypatch, tmp_path)
+        monkeypatch.setenv("KIBANA_AGENT_CRED_CACHE_TTL", "0")
+        called = []
+        monkeypatch.setattr(
+            client,
+            "keychain_read",
+            lambda *a: called.append(a) or "x",  # type: ignore[func-returns-value]
+        )
+        assert client._cached_creds_get({"_name": "prd"}) is None
+        assert called == []
+
+    def test_zero_disables_writing_the_cache(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        self._isolate(monkeypatch, tmp_path)
+        monkeypatch.setenv("KIBANA_AGENT_CRED_CACHE_TTL", "0")
+        written = []
+        monkeypatch.setattr(client, "keychain_write", lambda *a: written.append(a))
+        client._cached_creds_put({"_name": "prd"}, "u", "p")
+        assert written == []

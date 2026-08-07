@@ -86,7 +86,9 @@ CACHE_TTL_MAPPING = 86400
 CACHE_TTL_CONTEXT = 86400
 
 _CRED_CACHE_SERVICE = "kibana-agent"
-_CRED_CACHE_TTL = 24 * 3600  # 24 hours
+_CRED_CACHE_TTL_DEFAULT = 24 * 3600  # 24 hours
+_CRED_CACHE_TTL_ENV = "KIBANA_AGENT_CRED_CACHE_TTL"
+_CRED_CACHE_TTL_CONFIG_KEY = "cred_cache_ttl"
 _CRED_CACHE_KEYS = ("cache-username", "cache-password", "cache-ts")
 
 _FIELD_CLAUSES = (
@@ -308,6 +310,42 @@ def keychain_delete(service: str, account: str) -> None:
         raise AuthError(f"Keyring error: {exc}\n{_KEYRING_HINT}") from exc
 
 
+def cred_cache_ttl() -> int:
+    """
+    Resolve the credentials-cache TTL in seconds.
+    Precedence: env var > config file > default (24h).
+    A value of 0 or less turns caching off.
+    """
+    raw: Any = os.environ.get(_CRED_CACHE_TTL_ENV)
+    if raw is None:
+        raw = load_config().get(_CRED_CACHE_TTL_CONFIG_KEY)
+    if raw is None:
+        return _CRED_CACHE_TTL_DEFAULT
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return _CRED_CACHE_TTL_DEFAULT
+
+
+def cred_cache_ttl_source() -> str:
+    """Say where the effective TTL comes from, so `cred-cache-ttl` can report it."""
+    if os.environ.get(_CRED_CACHE_TTL_ENV) is not None:
+        return f"env ({_CRED_CACHE_TTL_ENV})"
+    if _CRED_CACHE_TTL_CONFIG_KEY in load_config():
+        return "config"
+    return "default"
+
+
+def set_cred_cache_ttl(seconds: int | None) -> None:
+    """Store the TTL in the config file. ``None`` removes the override."""
+    config = load_config()
+    if seconds is None:
+        config.pop(_CRED_CACHE_TTL_CONFIG_KEY, None)
+    else:
+        config[_CRED_CACHE_TTL_CONFIG_KEY] = seconds
+    save_config(config)
+
+
 def _cred_cache_accounts(profile: dict[str, Any]) -> tuple[str, str, str]:
     """
     Keyring account names for one profile.
@@ -321,12 +359,15 @@ def _cred_cache_accounts(profile: dict[str, Any]) -> tuple[str, str, str]:
 
 def _cached_creds_get(profile: dict[str, Any]) -> tuple[str, str] | None:
     """Read cached credentials for this profile from the OS keyring, if fresh."""
+    ttl = cred_cache_ttl()
+    if ttl <= 0:
+        return None
     user_key, pass_key, ts_key = _cred_cache_accounts(profile)
     timestamp = keychain_read(_CRED_CACHE_SERVICE, ts_key)
     if not timestamp:
         return None
     try:
-        if time.time() - float(timestamp) > _CRED_CACHE_TTL:
+        if time.time() - float(timestamp) > ttl:
             return None
     except ValueError:
         return None
@@ -336,6 +377,8 @@ def _cached_creds_get(profile: dict[str, Any]) -> tuple[str, str] | None:
 
 
 def _cached_creds_put(profile: dict[str, Any], username: str, password: str) -> None:
+    if cred_cache_ttl() <= 0:
+        return
     user_key, pass_key, ts_key = _cred_cache_accounts(profile)
     keychain_write(_CRED_CACHE_SERVICE, user_key, username)
     keychain_write(_CRED_CACHE_SERVICE, pass_key, password)
@@ -377,7 +420,8 @@ def _auth_1password(auth: dict[str, Any]) -> tuple[str, str]:
             if "promptError" in (exc.stderr or ""):
                 hint = (
                     "\nHint: run this command in a terminal that can show Touch ID. "
-                    "Credentials will be cached in the OS keyring for 30 min."
+                    "Credentials are cached in the OS keyring for 24h "
+                    "(change it with `kibana-agent cred-cache-ttl`)."
                 )
             raise AuthError(f"op error: {(exc.stderr or '').strip()}{hint}") from exc
 
