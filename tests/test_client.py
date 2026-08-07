@@ -34,6 +34,16 @@ PLAIN_PROFILE: dict[str, Any] = {
     "auth": {"type": "plain", "username": "alice", "password": "s3cret"},
 }
 
+INDEX_NAMES = [
+    "k8s-edo-000397",
+    "k8s-kasa-2026.08.07",
+    "alb-logs-d-2026-08-07",
+    "antivirus-2026.08.07",
+    "gitlab-2026.08.07",
+    "node-2026.08.07",
+]
+INDEX_PREFIXES = ["alb-logs-d-*", "antivirus-*", "gitlab-*", "k8s-edo-*", "k8s-kasa-*", "node-*"]
+
 
 class FakeResponse:
     def __init__(self, payload: Any, status: int = 200) -> None:
@@ -886,3 +896,43 @@ class TestCacheVersionStamp:
         path = client._cache_path({"_name": "prd"}, "ctx")
         path.write_text(json.dumps({"_t": time.time(), "_p": {"a": 1}}))
         assert client.cache_get({"_name": "prd"}, "ctx", 3600) is None
+
+
+class TestSelectPatterns:
+    def test_noted_patterns_come_first(self) -> None:
+        notes = {"edo-logs": "k8s-edo-*", "kasa-logs": "k8s-kasa-*"}
+        chosen = client._select_patterns(notes, INDEX_NAMES, INDEX_PREFIXES)
+        assert chosen[:2] == ["k8s-edo-*", "k8s-kasa-*"]
+
+    def test_prefixes_fill_the_rest(self) -> None:
+        notes = {"edo-logs": "k8s-edo-*"}
+        chosen = client._select_patterns(notes, INDEX_NAMES, INDEX_PREFIXES)
+        assert len(chosen) == client.MAX_CONTEXT_PATTERNS
+        assert chosen[0] == "k8s-edo-*"
+        assert chosen.count("k8s-edo-*") == 1
+
+    def test_no_notes_falls_back_to_prefixes(self) -> None:
+        chosen = client._select_patterns({}, INDEX_NAMES, INDEX_PREFIXES)
+        assert chosen == INDEX_PREFIXES[: client.MAX_CONTEXT_PATTERNS]
+
+    def test_a_note_that_is_not_a_pattern_is_ignored(self) -> None:
+        notes = {"status-field": "http.response_code", "edo-logs": "k8s-edo-*"}
+        assert client._noted_patterns(notes, INDEX_NAMES) == ["k8s-edo-*"]
+
+    def test_a_note_naming_a_missing_index_is_ignored(self) -> None:
+        assert client._noted_patterns({"gone": "retired-*"}, INDEX_NAMES) == []
+
+    def test_an_exact_index_name_counts_as_a_pattern(self) -> None:
+        assert client._noted_patterns({"one": "k8s-edo-000397"}, INDEX_NAMES) == ["k8s-edo-000397"]
+
+    def test_duplicate_note_values_are_kept_once(self) -> None:
+        notes = {"a": "k8s-edo-*", "b": "k8s-edo-*"}
+        assert client._noted_patterns(notes, INDEX_NAMES) == ["k8s-edo-*"]
+
+    def test_too_many_noted_patterns_are_capped_and_warned(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        notes = {f"n{i}": p for i, p in enumerate(INDEX_PREFIXES)}
+        chosen = client._select_patterns(notes, INDEX_NAMES, INDEX_PREFIXES)
+        assert chosen == INDEX_PREFIXES[: client.MAX_CONTEXT_PATTERNS]
+        assert "context --indices" in capsys.readouterr().err

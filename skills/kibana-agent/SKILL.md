@@ -66,6 +66,12 @@ kibana-agent agent-help
      `time_field`, total docs, `first`/`last` document time, and docs in the last hour.
    - `mappings` — field types, capped per pattern; use `fields <pattern> '<glob>'` for the rest.
 
+   `indices` and `mappings` cover five patterns, not all of them. **The patterns named in your
+   notes come first**, so a note like `edo-logs="k8s-edo-*"` puts that mapping in the first call.
+   Without notes you get the first five patterns alphabetically, which is a sample, not a choice —
+   so on an unfamiliar cluster write the note as soon as you find the right index, and the next
+   `context` will describe it. `context --indices '<a>,<b>'` asks for specific ones.
+
    Read `first`/`last` before you trust a zero: an index whose last document is days old will
    return nothing for `--last 1h` no matter how good the query is. Read `time_field` too — not
    every index uses `@timestamp`, and `--time-field` overrides it.

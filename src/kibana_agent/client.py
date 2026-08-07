@@ -82,6 +82,7 @@ MAX_SOURCE_LEN = 1000
 MAX_RESPONSE_HITS = 500
 MAX_RESPONSE_BYTES = 2_000_000
 MAX_CONTEXT_FIELDS = 60
+MAX_CONTEXT_PATTERNS = 5
 CACHE_TTL_ALIASES = 86400
 CACHE_TTL_MAPPING = 86400
 CACHE_TTL_CONTEXT = 86400
@@ -540,6 +541,11 @@ def cache_put(profile: dict[str, Any], name: str, payload: Any) -> None:
     path = _cache_path(profile, name)
     envelope = {"_t": time.time(), "_v": CACHE_VERSION, "_p": payload}
     path.write_text(json.dumps(envelope, ensure_ascii=False))
+
+
+def cache_drop(profile: dict[str, Any], name: str) -> None:
+    with contextlib.suppress(OSError):
+        _cache_path(profile, name).unlink()
 
 
 def _clear_dir(root: Path) -> int:
@@ -1142,6 +1148,45 @@ def _extract_prefixes(raw: dict[str, Any]) -> list[str]:
     return sorted(prefixes)
 
 
+def _noted_patterns(notes: dict[str, str], index_names: list[str]) -> list[str]:
+    """
+    Pick the index patterns out of the profile notes, in the order they were
+    written. A note value counts as a pattern only when it matches a real index,
+    so a note that records a field name is left alone.
+    """
+    found: list[str] = []
+    for value in notes.values():
+        if not isinstance(value, str) or value in found:
+            continue
+        if any(fnmatch.fnmatch(name, value) for name in index_names):
+            found.append(value)
+    return found
+
+
+def _select_patterns(
+    notes: dict[str, str], index_names: list[str], prefixes: list[str]
+) -> list[str]:
+    """
+    Choose which patterns "context" describes in full. Patterns named in the
+    notes come first: the user recorded them because they matter. The rest of
+    the room goes to the first prefixes, so a new cluster still gets a sample.
+    """
+    chosen = _noted_patterns(notes, index_names)
+    dropped = len(chosen) - MAX_CONTEXT_PATTERNS
+    if dropped > 0:
+        warn(
+            f"Notes name {len(chosen)} index patterns but context describes "
+            f"{MAX_CONTEXT_PATTERNS}. Run `context --indices '<a>,<b>'` for the other {dropped}."
+        )
+        return chosen[:MAX_CONTEXT_PATTERNS]
+    for prefix in prefixes:
+        if len(chosen) >= MAX_CONTEXT_PATTERNS:
+            break
+        if prefix not in chosen:
+            chosen.append(prefix)
+    return chosen
+
+
 def _time_range_filter(time_range: str, field: str = "@timestamp") -> dict[str, Any]:
     return {"range": {field: {"gte": f"now-{time_range}"}}}
 
@@ -1503,7 +1548,10 @@ def op_context(
     cache_put(profile, "aliases", aliases_data)
     prefixes = _extract_prefixes(raw)  # type: ignore[arg-type]
 
-    patterns = [p.strip() for p in indices.split(",")] if indices else prefixes[:5]
+    if indices:
+        patterns = [p.strip() for p in indices.split(",")]
+    else:
+        patterns = _select_patterns(notes, list(raw), prefixes)
 
     mappings: dict[str, Any] = {}
     stats: dict[str, Any] = {}
@@ -1698,6 +1746,7 @@ def op_set_notes(profile: dict[str, Any], facts: dict[str, str]) -> dict[str, st
     else:
         profile_data.pop("notes", None)
     save_config(config)
+    cache_drop(profile, "context")
     return notes
 
 

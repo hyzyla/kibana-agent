@@ -1083,6 +1083,9 @@ All write operations are blocked. Safe to use in automated pipelines.
    indices and fields exist. The notes say which index to use; never guess one
    when a note names it. `context` also reports, per pattern, the detected
    `time_field`, the first and last document time, and how many fields exist.
+   It describes five patterns in full, and a pattern named in the notes comes
+   before one picked alphabetically — so writing a note also improves what the
+   next `context` shows. Use `--indices '<a>,<b>'` to ask for others.
 2. `kibana-agent search <idx> --last 1h -n 3` — sample recent docs.
 3. Refine: add `-q`, `-f`, `--aggs`, adjust `--last` and `-n`.
 4. `kibana-agent histogram <idx> --last 6h --interval 10m` — spot trends.
