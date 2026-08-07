@@ -18,7 +18,7 @@ kibana-agent profile create prd --url https://kibana.example.com --auth 1passwor
   --op-username "op://vault/item/username" --op-password "op://vault/item/password" --use
 ```
 
-Auth: `1password` (Touch ID, cached 30 min), `keychain` (OS keyring — macOS Keychain / Linux Secret Service / Windows Credential Locker via the [`keyring`](https://pypi.org/project/keyring/) library; on Linux requires a running Secret Service provider such as gnome-keyring, KWallet, or KeePassXC), `plain`.
+Auth: `1password` (Touch ID, cached 24h per profile), `keychain` (OS keyring — macOS Keychain / Linux Secret Service / Windows Credential Locker via the [`keyring`](https://pypi.org/project/keyring/) library; on Linux requires a running Secret Service provider such as gnome-keyring, KWallet, or KeePassXC), `plain`.
 
 ## Usage
 
@@ -33,13 +33,36 @@ kibana-agent discover 'my-index-*' --kql "level:ERROR"            # Kibana URL
 
 ## Agent setup
 
+### Install the skill (recommended)
+
+This repo ships an [agent skill](skills/kibana-agent/SKILL.md) that teaches an agent how to drive
+the CLI: which query matches which field type, how to read the hints on stderr, and why an empty
+result is usually a wrong query rather than missing data.
+
+```bash
+npx skills add hyzyla/kibana-agent -g     # all projects
+npx skills add hyzyla/kibana-agent        # this project only
+npx skills update                         # pull later changes
+```
+
+This works with any agent the [skills CLI](https://github.com/vercel-labs/skills) supports — Claude
+Code, Cursor, Codex, and others. For Claude Code it installs to `~/.claude/skills/` (global) or
+`.claude/skills/` (project), and loads automatically when you ask about Kibana, Elasticsearch, or
+logs.
+
+To install by hand instead, copy or symlink `skills/kibana-agent/` into your agent's skills
+directory.
+
+### Without a skill
+
 Add to your `CLAUDE.md` (or equivalent system prompt):
 
 ```markdown
 Use `kibana-agent` to query Elasticsearch. Start with `kibana-agent context` to
 discover indices and fields, then use `kibana-agent search`, `kibana-agent count`,
-`kibana-agent histogram` to investigate. Run `kibana-agent agent-help` for full
-usage reference.
+`kibana-agent histogram` to investigate. Read stderr: the CLI warns when a query
+cannot match and explains empty results. Run `kibana-agent agent-help` for the
+full reference.
 ```
 
 Output is JSON. All operations are read-only.
