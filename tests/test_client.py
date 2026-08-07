@@ -200,9 +200,7 @@ class TestResolveProfile:
         prof = resolve_profile("prd")
         assert prof["kibana_url"] == "https://prd.example"
 
-    def test_falls_back_to_active(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
-    ) -> None:
+    def test_falls_back_to_active(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
         self._isolate_config(
             monkeypatch,
             tmp_path,
@@ -274,9 +272,7 @@ class TestResolveProfile:
         with pytest.raises(ProfileNotFoundError, match="profile create"):
             resolve_profile()
 
-    def test_explicit_arg_beats_env(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
-    ) -> None:
+    def test_explicit_arg_beats_env(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
         self._isolate_config(
             monkeypatch,
             tmp_path,
@@ -341,9 +337,7 @@ class TestEs:
 
 
 class TestOpSearch:
-    def test_builds_query_with_kql_and_time_range(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_builds_query_with_kql_and_time_range(self, monkeypatch: pytest.MonkeyPatch) -> None:
         rec = RequestRecorder(
             {
                 "hits": {
@@ -382,6 +376,7 @@ class TestOpSearch:
             PLAIN_PROFILE,
             "logs-*",
             extra_query='{"match":{"level":"ERROR"}}',
+            hints=False,  # hints would add a diagnosis request after the zero result
         )
         body = rec.last_json
         assert body is not None
@@ -507,3 +502,222 @@ class TestOpTailPage:
         assert body["search_after"] == [42, "z"]
         # No time range filter once we have a cursor
         assert body["query"]["bool"]["must"] == []
+
+
+class TestPluck:
+    def test_nested_path(self) -> None:
+        assert client._pluck({"logs": {"message": "hi"}}, "logs.message") == "hi"
+
+    def test_deep_nested_path(self) -> None:
+        assert client._pluck({"a": {"b": {"c": 1}}}, "a.b.c") == 1
+
+    def test_flat_dotted_key(self) -> None:
+        assert client._pluck({"logs.message": "hi"}, "logs.message") == "hi"
+
+    def test_missing_path(self) -> None:
+        assert client._pluck({"logs": {"message": "hi"}}, "logs.level") is None
+
+    def test_path_through_non_dict(self) -> None:
+        assert client._pluck({"logs": "text"}, "logs.message") is None
+
+
+class TestFormatHitNestedFields:
+    def test_selects_nested_fields(self) -> None:
+        hit = {"_source": {"@timestamp": "t", "logs": {"message": "hi", "level": "ERROR"}}}
+        out = client._format_hit(hit, ["@timestamp", "logs.message"])
+        assert out == {"@timestamp": "t", "logs.message": "hi"}
+
+    def test_missing_field_is_omitted(self) -> None:
+        hit = {"_source": {"@timestamp": "t", "logs": {"message": "hi"}}}
+        assert client._format_hit(hit, ["@timestamp", "logs.absent"]) == {"@timestamp": "t"}
+
+
+class TestFlattenPropertiesMultiFields:
+    def test_includes_multi_fields(self) -> None:
+        props = {"logger": {"type": "text", "fields": {"keyword": {"type": "keyword"}}}}
+        assert client._flatten_properties(props) == {
+            "logger": "text",
+            "logger.keyword": "keyword",
+        }
+
+    def test_nested_object_with_multi_field(self) -> None:
+        props = {
+            "logs": {
+                "properties": {"msg": {"type": "text", "fields": {"raw": {"type": "keyword"}}}}
+            }
+        }
+        assert client._flatten_properties(props) == {
+            "logs.msg": "text",
+            "logs.msg.raw": "keyword",
+        }
+
+
+class TestCollectFields:
+    def test_match_phrase(self) -> None:
+        out: list[tuple[str, str]] = []
+        client._collect_query_fields({"match_phrase": {"a.b": "x"}}, out)
+        assert out == [("a.b", "match_phrase")]
+
+    def test_nested_bool(self) -> None:
+        out: list[tuple[str, str]] = []
+        query = {"bool": {"must": [{"term": {"a": 1}}, {"range": {"@timestamp": {"gte": "x"}}}]}}
+        client._collect_query_fields(query, out)
+        assert out == [("a", "term"), ("@timestamp", "range")]
+
+    def test_exists_clause(self) -> None:
+        out: list[tuple[str, str]] = []
+        client._collect_query_fields({"exists": {"field": "a"}}, out)
+        assert out == [("a", "exists")]
+
+    def test_match_all_has_no_fields(self) -> None:
+        out: list[tuple[str, str]] = []
+        client._collect_query_fields({"match_all": {}}, out)
+        assert out == []
+
+    def test_agg_fields(self) -> None:
+        out: list[str] = []
+        aggs = {"outer": {"terms": {"field": "a"}, "aggs": {"inner": {"max": {"field": "b"}}}}}
+        client._collect_agg_fields(aggs, out)
+        assert sorted(out) == ["a", "b"]
+
+
+TYPES = {
+    "@timestamp": "date",
+    "code": "long",
+    "msg": "text",
+    "logger": "text",
+    "logger.keyword": "keyword",
+}
+
+
+class TestFieldWarnings:
+    def test_unknown_query_field(self) -> None:
+        assert "not in the mapping" in client._field_warnings(TYPES, [("nope", "match")], [])[0]
+
+    def test_term_on_text_suggests_keyword_sibling(self) -> None:
+        assert "logger.keyword" in client._field_warnings(TYPES, [("logger", "terms")], [])[0]
+
+    def test_term_on_text_without_sibling(self) -> None:
+        assert "match_phrase" in client._field_warnings(TYPES, [("msg", "term")], [])[0]
+
+    def test_agg_on_text_field(self) -> None:
+        assert "no doc values" in client._field_warnings(TYPES, [], ["msg"])[0]
+
+    def test_valid_query_and_agg_are_silent(self) -> None:
+        refs = [("@timestamp", "range"), ("code", "term"), ("msg", "match")]
+        assert client._field_warnings(TYPES, refs, ["code", "logger.keyword"]) == []
+
+
+class TestSuggestFields:
+    def test_suggests_a_misspelling(self) -> None:
+        types = {"logs.message": "text", "logs.level": "text"}
+        assert "logs.message" in client._suggest_fields(types, "logs.mesage")
+
+    def test_suggests_by_shared_word(self) -> None:
+        types = {"http.response_code": "long", "user.name": "keyword"}
+        assert client._suggest_fields(types, "http.response_status_int") == ["http.response_code"]
+
+    def test_no_suggestion_when_nothing_is_close(self) -> None:
+        assert client._suggest_fields({"aaa": "long"}, "zzz") == []
+
+
+class TestDetectTimeField:
+    def test_prefers_at_timestamp(self) -> None:
+        assert client._detect_time_field({"@timestamp": "date", "event.created": "date"}) == (
+            "@timestamp"
+        )
+
+    def test_falls_back_to_known_name(self) -> None:
+        assert client._detect_time_field({"event.created": "date", "x": "date"}) == "event.created"
+
+    def test_picks_a_date_field_when_no_name_is_known(self) -> None:
+        assert client._detect_time_field({"ingested_at": "date"}) == "ingested_at"
+
+    def test_none_when_no_date_field(self) -> None:
+        assert client._detect_time_field({"msg": "text"}) is None
+
+
+class TestTrimFields:
+    def test_short_mapping_is_untouched(self) -> None:
+        fields = {"a": "long", "b": "text"}
+        assert client._trim_fields(fields, "idx-*") == fields
+
+    def test_long_mapping_is_capped_with_a_pointer(self) -> None:
+        fields = {f"f{i:03d}": "long" for i in range(100)}
+        trimmed = client._trim_fields(fields, "idx-*")
+        assert len(trimmed) == client.MAX_CONTEXT_FIELDS + 1
+        assert "40 more fields" in trimmed["…"]
+
+
+class TestScopeAndNotes:
+    def test_scope_reports_profile_only_by_default(self) -> None:
+        assert client._scope({"_name": "prd"}) == {"profile": "prd"}
+
+    def test_scope_includes_space_index_and_locks(self) -> None:
+        profile = {"_name": "prd", "space": "ops", "index": "logs-*", "restrict_index": True}
+        assert client._scope(profile) == {
+            "profile": "prd",
+            "space": "ops",
+            "index": "logs-*",
+            "restricted": ["restrict_index"],
+        }
+
+    def test_notes_come_first(self) -> None:
+        merged = client._with_notes({"ts": "t", "prefixes": []}, {"app": "logs-*"})
+        assert list(merged) == ["notes", "ts", "prefixes"]
+
+    def test_empty_notes_add_no_key(self) -> None:
+        assert client._with_notes({"ts": "t"}, {}) == {"ts": "t"}
+
+
+class TestCheckEsErrorOn200:
+    def test_auth_error_raises(self) -> None:
+        body = {
+            "error": {"type": "security_exception", "reason": "unable to authenticate user"},
+            "status": 401,
+        }
+        with pytest.raises(KibanaApiError) as excinfo:
+            client._check_es_error(body, {"_name": "prd"}, "svc")
+        assert "unable to authenticate user" in str(excinfo.value)
+        assert "cache-clear --creds-only" in str(excinfo.value)
+
+    def test_string_error_raises(self) -> None:
+        with pytest.raises(KibanaApiError):
+            client._check_es_error({"error": "Forbidden"}, {"_name": "prd"}, "svc")
+
+    def test_clean_response_passes(self) -> None:
+        client._check_es_error({"hits": {"hits": []}}, {"_name": "prd"}, "svc")
+
+    def test_index_named_error_is_not_an_error(self) -> None:
+        client._check_es_error({"error": {"aliases": {}}}, {"_name": "prd"}, "svc")
+
+    def test_shard_failure_warns_but_continues(self, capsys: pytest.CaptureFixture[str]) -> None:
+        client._check_es_error({"_shards": {"total": 5, "failed": 2}}, {"_name": "prd"}, "svc")
+        assert "2 of 5 shards failed" in capsys.readouterr().err
+
+
+class TestProfileScopedCaches:
+    def test_cache_path_uses_the_given_profile(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(client, "CACHE_DIR", tmp_path)
+        one = client._cache_path({"_name": "one"}, "context")
+        two = client._cache_path({"_name": "two"}, "context")
+        assert one != two
+        assert one.parent.name == "one"
+
+    def test_cred_accounts_differ_per_profile(self) -> None:
+        assert client._cred_cache_accounts({"_name": "one"}) != client._cred_cache_accounts(
+            {"_name": "two"}
+        )
+
+    def test_clears_only_the_named_profile(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(client, "CACHE_DIR", tmp_path)
+        for name in ("one", "two"):
+            directory = tmp_path / name
+            directory.mkdir()
+            (directory / "aliases.json").write_text("{}")
+        assert client.cache_clear_profile({"_name": "one"}) == 1
+        assert (tmp_path / "two" / "aliases.json").exists()

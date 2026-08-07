@@ -93,9 +93,7 @@ def test_list_profiles_returns_dict(monkeypatch: pytest.MonkeyPatch) -> None:
         lambda: [{"name": "prd", "active": True, "kibana_url": "https://x"}],
     )
     result = server.list_profiles()
-    assert result == {
-        "profiles": [{"name": "prd", "active": True, "kibana_url": "https://x"}]
-    }
+    assert result == {"profiles": [{"name": "prd", "active": True, "kibana_url": "https://x"}]}
 
 
 def test_tail_logs_passes_cursor(monkeypatch: pytest.MonkeyPatch) -> None:

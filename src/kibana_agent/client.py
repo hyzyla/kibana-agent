@@ -14,6 +14,7 @@ This module knows nothing about Click or MCP. It exposes:
 from __future__ import annotations
 
 import contextlib
+import difflib
 import fnmatch
 import hashlib
 import json
@@ -73,18 +74,56 @@ class DryRunResult(KibanaAgentError):
 
 DEFAULT_TIME_RANGE = "1h"
 DEFAULT_SIZE = 5
-DEFAULT_SORT = "@timestamp:desc"
+DEFAULT_TIME_FIELD = "@timestamp"
+DEFAULT_SORT = f"{DEFAULT_TIME_FIELD}:desc"
 DEFAULT_TIMEOUT = 30
 MAX_SOURCE_LEN = 1000
 MAX_RESPONSE_HITS = 500
 MAX_RESPONSE_BYTES = 2_000_000
-CACHE_TTL_ALIASES = 3600
+MAX_CONTEXT_FIELDS = 60
+CACHE_TTL_ALIASES = 86400
 CACHE_TTL_MAPPING = 86400
-CACHE_TTL_CONTEXT = 3600
+CACHE_TTL_CONTEXT = 86400
 
 _CRED_CACHE_SERVICE = "kibana-agent"
-_CRED_CACHE_TTL = 30 * 60  # 30 minutes
+_CRED_CACHE_TTL = 24 * 3600  # 24 hours
 _CRED_CACHE_KEYS = ("cache-username", "cache-password", "cache-ts")
+
+_FIELD_CLAUSES = (
+    "match",
+    "match_phrase",
+    "match_phrase_prefix",
+    "term",
+    "terms",
+    "range",
+    "wildcard",
+    "prefix",
+    "regexp",
+    "fuzzy",
+)
+_EXACT_CLAUSES = ("term", "terms")
+_ANALYZED_TYPES = ("text", "match_only_text", "annotated_text")
+_EXACT_TYPES = ("keyword", "constant_keyword", "wildcard")
+_DATE_TYPES = ("date", "date_nanos")
+_AGGREGATABLE_TYPES = (
+    _EXACT_TYPES
+    + _DATE_TYPES
+    + (
+        "long",
+        "integer",
+        "short",
+        "byte",
+        "double",
+        "float",
+        "half_float",
+        "scaled_float",
+        "boolean",
+        "ip",
+    )
+)
+_TIME_FIELD_PREFERENCE = ("@timestamp", "timestamp", "time", "event.created", "event.ingested")
+
+PROFILE_NAME_KEY = "_name"
 
 _KEYRING_HINT = (
     "No OS keyring backend is available. On Linux, install and start a Secret "
@@ -139,9 +178,7 @@ def _resolve_dir(
     if sys.platform == "win32":
         base = os.environ.get(win_var)
         if not base:
-            base = str(
-                Path.home() / "AppData" / ("Local" if win_subdir else "Roaming")
-            )
+            base = str(Path.home() / "AppData" / ("Local" if win_subdir else "Roaming"))
         path = Path(base) / "kibana-agent"
         return path / win_subdir if win_subdir else path
     xdg = os.environ.get(xdg_var)
@@ -189,10 +226,32 @@ def get_profile(name: str | None = None) -> dict[str, Any]:
         raise ProfileNotFoundError("No active profile. Run: profile create <name> ...")
     profile_data = config.get("profiles", {}).get(profile_name)
     if not profile_data:
-        raise ProfileNotFoundError(
-            f"Profile '{profile_name}' not found. Run: profile list"
-        )
+        raise ProfileNotFoundError(f"Profile '{profile_name}' not found. Run: profile list")
+    profile_data[PROFILE_NAME_KEY] = profile_name
     return profile_data  # type: ignore[no-any-return]
+
+
+def profile_label(profile: dict[str, Any]) -> str:
+    """
+    Return a stable name for a profile, for messages and cache keys.
+    A profile built from environment variables has no name, so fall back to a
+    short hash of its identity.
+    """
+    named = profile.get(PROFILE_NAME_KEY)
+    if named:
+        return str(named)
+    digest = hashlib.md5(_profile_cache_key(profile).encode()).hexdigest()[:8]
+    return f"env-{digest}"
+
+
+def profile_notes(profile: dict[str, Any]) -> dict[str, str]:
+    """
+    Return the notes of a profile: facts the cluster cannot tell you, such as
+    which index pattern holds which application. Read fresh from the config on
+    every call, so an edit shows up even when the rest of the output is cached.
+    """
+    stored = load_config().get("profiles", {}).get(profile_label(profile), {}).get("notes")
+    return dict(stored) if isinstance(stored, dict) else {}
 
 
 _IS_MACOS = sys.platform == "darwin"
@@ -249,9 +308,21 @@ def keychain_delete(service: str, account: str) -> None:
         raise AuthError(f"Keyring error: {exc}\n{_KEYRING_HINT}") from exc
 
 
-def _cached_creds_get() -> tuple[str, str] | None:
-    """Read cached credentials from the OS keyring if still within TTL."""
-    timestamp = keychain_read(_CRED_CACHE_SERVICE, "cache-ts")
+def _cred_cache_accounts(profile: dict[str, Any]) -> tuple[str, str, str]:
+    """
+    Keyring account names for one profile.
+    Namespacing by profile stops a stale credential for one cluster from being
+    served to another.
+    """
+    label = re.sub(r"[^\w\-.]", "_", profile_label(profile))
+    user_key, pass_key, ts_key = _CRED_CACHE_KEYS
+    return (f"{user_key}-{label}", f"{pass_key}-{label}", f"{ts_key}-{label}")
+
+
+def _cached_creds_get(profile: dict[str, Any]) -> tuple[str, str] | None:
+    """Read cached credentials for this profile from the OS keyring, if fresh."""
+    user_key, pass_key, ts_key = _cred_cache_accounts(profile)
+    timestamp = keychain_read(_CRED_CACHE_SERVICE, ts_key)
     if not timestamp:
         return None
     try:
@@ -259,20 +330,31 @@ def _cached_creds_get() -> tuple[str, str] | None:
             return None
     except ValueError:
         return None
-    username = keychain_read(_CRED_CACHE_SERVICE, "cache-username")
-    password = keychain_read(_CRED_CACHE_SERVICE, "cache-password")
+    username = keychain_read(_CRED_CACHE_SERVICE, user_key)
+    password = keychain_read(_CRED_CACHE_SERVICE, pass_key)
     return (username, password) if username and password else None
 
 
-def _cached_creds_put(username: str, password: str) -> None:
-    keychain_write(_CRED_CACHE_SERVICE, "cache-username", username)
-    keychain_write(_CRED_CACHE_SERVICE, "cache-password", password)
-    keychain_write(_CRED_CACHE_SERVICE, "cache-ts", str(time.time()))
+def _cached_creds_put(profile: dict[str, Any], username: str, password: str) -> None:
+    user_key, pass_key, ts_key = _cred_cache_accounts(profile)
+    keychain_write(_CRED_CACHE_SERVICE, user_key, username)
+    keychain_write(_CRED_CACHE_SERVICE, pass_key, password)
+    keychain_write(_CRED_CACHE_SERVICE, ts_key, str(time.time()))
+
+
+def cached_creds_clear_profile(profile: dict[str, Any]) -> None:
+    for account in _cred_cache_accounts(profile):
+        keychain_delete(_CRED_CACHE_SERVICE, account)
+    _creds_cache.pop(_profile_cache_key(profile), None)
 
 
 def cached_creds_clear() -> None:
-    for key in _CRED_CACHE_KEYS:
-        keychain_delete(_CRED_CACHE_SERVICE, key)
+    for name in list(load_config().get("profiles", {})):
+        with contextlib.suppress(KibanaAgentError):
+            cached_creds_clear_profile(get_profile(name))
+    for account in _CRED_CACHE_KEYS:  # entries written before the per-profile keys
+        keychain_delete(_CRED_CACHE_SERVICE, account)
+    _creds_cache.clear()
 
 
 def _auth_1password(auth: dict[str, Any]) -> tuple[str, str]:
@@ -352,7 +434,7 @@ def creds(profile: dict[str, Any]) -> tuple[str, str]:
     auth_type = auth["type"]
 
     if auth_type in ("1password", "keychain"):
-        cached = _cached_creds_get()
+        cached = _cached_creds_get(profile)
         if cached:
             _creds_cache[key] = cached
             return cached
@@ -365,22 +447,24 @@ def creds(profile: dict[str, Any]) -> tuple[str, str]:
     _creds_cache[key] = (username, password)
 
     if auth_type in ("1password", "keychain"):
-        _cached_creds_put(username, password)
+        _cached_creds_put(profile, username, password)
 
     return username, password
 
 
-def _cache_path(name: str) -> Path:
-    config = load_config()
-    profile_name = config.get("active") or "_default"
-    profile_dir = CACHE_DIR / re.sub(r"[^\w\-.]", "_", profile_name)
+def _profile_cache_dir(profile: dict[str, Any]) -> Path:
+    return CACHE_DIR / re.sub(r"[^\w\-.]", "_", profile_label(profile))
+
+
+def _cache_path(profile: dict[str, Any], name: str) -> Path:
+    profile_dir = _profile_cache_dir(profile)
     profile_dir.mkdir(parents=True, exist_ok=True)
     safe_name = re.sub(r"[^\w.-]", "_", name)
     return profile_dir / f"{safe_name}.json"
 
 
-def cache_get(name: str, ttl: int) -> Any | None:
-    path = _cache_path(name)
+def cache_get(profile: dict[str, Any], name: str, ttl: int) -> Any | None:
+    path = _cache_path(profile, name)
     if not path.exists():
         return None
     try:
@@ -392,23 +476,35 @@ def cache_get(name: str, ttl: int) -> Any | None:
     return data.get("_p")
 
 
-def cache_put(name: str, payload: Any) -> None:
-    path = _cache_path(name)
+def cache_put(profile: dict[str, Any], name: str, payload: Any) -> None:
+    path = _cache_path(profile, name)
     path.write_text(json.dumps({"_t": time.time(), "_p": payload}, ensure_ascii=False))
 
 
-def cache_clear_all() -> int:
-    if not CACHE_DIR.exists():
+def _clear_dir(root: Path) -> int:
+    if not root.exists():
         return 0
     count = 0
-    for path in CACHE_DIR.rglob("*.json"):
+    for path in root.rglob("*.json"):
         path.unlink()
         count += 1
-    for directory in sorted(CACHE_DIR.rglob("*"), reverse=True):
+    for directory in sorted(root.rglob("*"), reverse=True):
         if directory.is_dir():
             with contextlib.suppress(OSError):
                 directory.rmdir()
     return count
+
+
+def cache_clear_profile(profile: dict[str, Any]) -> int:
+    directory = _profile_cache_dir(profile)
+    count = _clear_dir(directory)
+    with contextlib.suppress(OSError):
+        directory.rmdir()
+    return count
+
+
+def cache_clear_all() -> int:
+    return _clear_dir(CACHE_DIR)
 
 
 def _profile_from_env() -> dict[str, Any] | None:
@@ -505,6 +601,47 @@ def _guard(method: str, path: str) -> None:
         raise BlockedRequestError(f"Blocked: POST {path}")
 
 
+def warn(message: str) -> None:
+    """
+    Report something the caller should notice but that does not stop the call.
+    Goes to stderr so it never mixes into the data on stdout.
+    """
+    sys.stderr.write(f"Warning: {message}\n")
+
+
+def _auth_hint(profile: dict[str, Any], username: str) -> str:
+    label = profile_label(profile)
+    return (
+        f"Profile '{label}' authenticated as '{username}'. If that is the wrong user, "
+        f"the cached credentials are stale: "
+        f"kibana-agent cache-clear --creds-only --profile {label}"
+    )
+
+
+def _check_es_error(data: Any, profile: dict[str, Any], username: str) -> None:
+    """
+    Stop on an error that the Kibana proxy returned with HTTP 200.
+    Without this an auth or query error reads as an empty result set.
+    """
+    if not isinstance(data, dict):
+        return
+    error = data.get("error")
+    detail = None
+    if isinstance(error, str):
+        detail = error
+    elif isinstance(error, dict) and ("reason" in error or "type" in error):
+        detail = error.get("reason") or error.get("type")
+    if detail is not None:
+        status = data.get("status", 200)
+        message = str(detail)[:300]
+        if status in (401, 403) or "security_exception" in str(error):
+            message = f"{message}\n{_auth_hint(profile, username)}"
+        raise KibanaApiError(int(status) if isinstance(status, int) else 200, message)
+    shards = data.get("_shards")
+    if isinstance(shards, dict) and shards.get("failed"):
+        warn(f"{shards['failed']} of {shards.get('total', '?')} shards failed, results are partial")
+
+
 def _build_curl(
     url: str,
     method: str,
@@ -559,19 +696,35 @@ def es(
     actual_path = path + (
         ("&" if "?" in path else "?") + f"filter_path={filter_path}" if filter_path else ""
     )
-    response = requests.post(
-        f"{url}{prefix}/api/console/proxy",
-        params={"path": actual_path, "method": method},
-        headers={"kbn-xsrf": "true", "Content-Type": "application/json"},
-        json=body,
-        auth=(username, password),
-        timeout=timeout,
-    )
+    try:
+        response = requests.post(
+            f"{url}{prefix}/api/console/proxy",
+            params={"path": actual_path, "method": method},
+            headers={"kbn-xsrf": "true", "Content-Type": "application/json"},
+            json=body,
+            auth=(username, password),
+            timeout=timeout,
+        )
+    except requests.Timeout as exc:
+        raise KibanaAgentError(
+            f"Timeout after {timeout}s reaching {url}. Narrow the window with --last "
+            f"or ask for fewer hits with -n, or raise --timeout."
+        ) from exc
+    except requests.ConnectionError as exc:
+        raise KibanaAgentError(
+            f"Cannot reach {url}: {str(exc)[:200]}\n"
+            f"Check the network or VPN, then retry. This is not an empty result."
+        ) from exc
     if response.status_code >= 400:
-        raise KibanaApiError(response.status_code, response.text)
+        detail = response.text
+        if response.status_code in (401, 403):
+            detail = f"{detail[:300]}\n{_auth_hint(profile, username)}"
+        raise KibanaApiError(response.status_code, detail)
     if len(response.content) > MAX_RESPONSE_BYTES:
-        sys.stderr.write(f"Warning: {len(response.content):,}B response\n")
-    return response.json()  # type: ignore[no-any-return]
+        warn(f"{len(response.content):,}B response")
+    data = response.json()
+    _check_es_error(data, profile, username)
+    return data  # type: ignore[no-any-return]
 
 
 def _strip_empty(data: dict[str, Any]) -> dict[str, Any]:
@@ -593,15 +746,34 @@ def _resolve_index(profile: dict[str, Any], index_pattern: str | None) -> str:
         return index_pattern
     if default_index:
         return default_index
-    raise IndexResolutionError(
-        "No index pattern given and profile has no default index."
-    )
+    raise IndexResolutionError("No index pattern given and profile has no default index.")
+
+
+def _pluck(source: dict[str, Any], path: str) -> Any:
+    """
+    Read a dotted path out of a document.
+    Elasticsearch returns "_source" nested, so "a.b" arrives as {"a": {"b": ...}}.
+    Some documents keep the dotted name as one flat key, so try that first.
+    """
+    if path in source:
+        return source[path]
+    current: Any = source
+    for part in path.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
 
 
 def _format_hit(hit: dict[str, Any], field_list: list[str] | None) -> dict[str, Any]:
     source = hit.get("_source", {})
     if field_list:
-        source = {k: source[k] for k in field_list if k in source}
+        picked = {}
+        for path in field_list:
+            value = _pluck(source, path)
+            if value is not None:
+                picked[path] = value
+        source = picked
     out = _strip_empty(source)
     if hit.get("sort"):
         out["_sort"] = hit["sort"]
@@ -618,13 +790,20 @@ def _format_search_result(
     truncated = len(raw_hits) > MAX_RESPONSE_HITS
     limited_hits = raw_hits[:MAX_RESPONSE_HITS] if truncated else raw_hits
     hits = []
+    cut = 0
     for hit in limited_hits:
         formatted = _format_hit(hit, field_list)
         serialized = json.dumps(formatted, ensure_ascii=False, separators=(",", ":"))
         if max_source_len and len(serialized) > max_source_len:
             hits.append({"_truncated": serialized[:max_source_len] + "…"})
+            cut += 1
         else:
             hits.append(formatted)
+    if cut:
+        warn(
+            f"{cut} of {len(hits)} documents were cut at --max-source-len "
+            f"{max_source_len}. Raise it, or select the fields you need with -f."
+        )
     result: dict[str, Any] = {"total": total, "n": len(hits)}
     if truncated:
         result["truncated"] = len(raw_hits)
@@ -642,7 +821,149 @@ def _flatten_properties(properties: dict[str, Any], prefix: str = "") -> dict[st
             out.update(_flatten_properties(value["properties"], full_key))
         else:
             out[full_key] = value.get("type", "object")
+        for sub_name, sub_field in value.get("fields", {}).items():
+            out[f"{full_key}.{sub_name}"] = sub_field.get("type", "object")
     return out
+
+
+def _collect_query_fields(node: Any, out: list[tuple[str, str]]) -> None:
+    """Collect (field, clause) pairs referenced by a query DSL fragment."""
+    if isinstance(node, list):
+        for item in node:
+            _collect_query_fields(item, out)
+        return
+    if not isinstance(node, dict):
+        return
+    for clause, value in node.items():
+        if clause == "exists" and isinstance(value, dict) and "field" in value:
+            out.append((str(value["field"]), clause))
+        elif clause in _FIELD_CLAUSES and isinstance(value, dict) and value:
+            out.append((str(next(iter(value))), clause))
+        else:
+            _collect_query_fields(value, out)
+
+
+def _collect_agg_fields(node: Any, out: list[str]) -> None:
+    """Collect field names referenced by an aggregations fragment."""
+    if isinstance(node, list):
+        for item in node:
+            _collect_agg_fields(item, out)
+        return
+    if not isinstance(node, dict):
+        return
+    for key, value in node.items():
+        if key == "field" and isinstance(value, str):
+            out.append(value)
+        else:
+            _collect_agg_fields(value, out)
+
+
+def _mapping_types(mapping: dict[str, Any]) -> dict[str, str]:
+    """Merge the per-index groups of a parsed mapping into one field:type dict."""
+    types: dict[str, str] = {}
+    for fields in mapping.values():
+        if isinstance(fields, dict):
+            types.update(fields)
+    return types
+
+
+def _keyword_sibling(types: dict[str, str], field: str) -> str | None:
+    for candidate in (f"{field}.keyword", f"{field}.raw"):
+        if types.get(candidate) in _EXACT_TYPES:
+            return candidate
+    return None
+
+
+def _tokens(name: str) -> set[str]:
+    return {t for t in re.split(r"[._\-]", name.lower()) if len(t) > 2}
+
+
+def _suggest_fields(types: dict[str, str], field: str, limit: int = 3) -> list[str]:
+    """
+    Suggest field names close to one that is missing.
+    Tries spelling first, then names that share a word, which catches a guess
+    like "a.request_status_int" when the real field is "a.response_code".
+    """
+    close = difflib.get_close_matches(field, list(types), n=limit, cutoff=0.6)
+    if close:
+        return close
+    wanted = _tokens(field)
+    if not wanted:
+        return []
+    scored = [(len(wanted & _tokens(name)), name) for name in types]
+    return [name for score, name in sorted(scored, reverse=True) if score][:limit]
+
+
+def _detect_time_field(types: dict[str, str]) -> str | None:
+    """Return the best date field to filter on, preferring the common names."""
+    dates = [name for name, kind in types.items() if kind in _DATE_TYPES]
+    for preferred in _TIME_FIELD_PREFERENCE:
+        if preferred in dates:
+            return preferred
+    return sorted(dates, key=lambda name: (len(name), name))[0] if dates else None
+
+
+def _suffix(items: list[str]) -> str:
+    return f" Did you mean: {', '.join(items)}?" if items else ""
+
+
+def _field_warnings(
+    types: dict[str, str], query_refs: list[tuple[str, str]], agg_refs: list[str]
+) -> list[str]:
+    warnings: list[str] = []
+    for field, clause in query_refs:
+        field_type = types.get(field)
+        if field_type is None:
+            warnings.append(
+                f"field '{field}' is not in the mapping — this query cannot match."
+                f"{_suffix(_suggest_fields(types, field))}"
+            )
+        elif clause in _EXACT_CLAUSES and field_type in _ANALYZED_TYPES:
+            hint = _keyword_sibling(types, field)
+            fix = f"use '{hint}'" if hint else "use match_phrase"
+            warnings.append(
+                f"'{clause}' on analyzed {field_type} field '{field}' matches nothing — {fix}"
+            )
+    for field in agg_refs:
+        field_type = types.get(field)
+        if field_type is None:
+            warnings.append(
+                f"aggregation field '{field}' is not in the mapping."
+                f"{_suffix(_suggest_fields(types, field))}"
+            )
+        elif field_type in _ANALYZED_TYPES:
+            hint = _keyword_sibling(types, field)
+            fix = f"use '{hint}'" if hint else "aggregate on a keyword, numeric, or date field"
+            warnings.append(
+                f"aggregation on analyzed {field_type} field '{field}' has no doc values — {fix}"
+            )
+    return warnings
+
+
+def _trim_fields(fields: dict[str, str], pattern: str) -> dict[str, str]:
+    """Cap an inline field list, so one wide index does not fill the output."""
+    if len(fields) <= MAX_CONTEXT_FIELDS:
+        return fields
+    kept = dict(sorted(fields.items())[:MAX_CONTEXT_FIELDS])
+    kept["…"] = f"{len(fields) - MAX_CONTEXT_FIELDS} more fields — run: fields {pattern} '<glob>'"
+    return kept
+
+
+def _with_notes(ctx: dict[str, Any], notes: dict[str, str]) -> dict[str, Any]:
+    """Put the notes first, so they are the first thing an agent reads."""
+    return {"notes": notes, **ctx} if notes else ctx
+
+
+def _scope(profile: dict[str, Any]) -> dict[str, Any]:
+    """Say which profile, space, and index the commands will use."""
+    scope: dict[str, Any] = {"profile": profile_label(profile)}
+    for key in ("space", "index"):
+        if profile.get(key):
+            scope[key] = profile[key]
+    locked = [k for k in ("restrict_space", "restrict_index") if profile.get(k)]
+    if locked:
+        scope["restricted"] = locked
+    return scope
 
 
 def _parse_mapping(data: dict[str, Any]) -> dict[str, Any]:
@@ -726,12 +1047,12 @@ def fetch_aliases(
     profile: dict[str, Any], *, no_cache: bool = False, **kwargs: Any
 ) -> dict[str, list[str]]:
     if not no_cache:
-        cached = cache_get("aliases", CACHE_TTL_ALIASES)
+        cached = cache_get(profile, "aliases", CACHE_TTL_ALIASES)
         if cached is not None:
             return cached  # type: ignore[no-any-return]
     data = es(profile, "GET", "_aliases", **kwargs)
     result = _parse_aliases(data)  # type: ignore[arg-type]
-    cache_put("aliases", result)
+    cache_put(profile, "aliases", result)
     return result
 
 
@@ -740,20 +1061,171 @@ def fetch_mapping(
 ) -> dict[str, Any]:
     cache_name = f"mapping_{index}"
     if not no_cache:
-        cached = cache_get(cache_name, CACHE_TTL_MAPPING)
+        cached = cache_get(profile, cache_name, CACHE_TTL_MAPPING)
         if cached is not None:
             return cached  # type: ignore[no-any-return]
     data = es(profile, "GET", f"{index}/_mapping", **kwargs)
     result = _parse_mapping(data)  # type: ignore[arg-type]
-    cache_put(cache_name, result)
+    cache_put(profile, cache_name, result)
     return result
+
+
+def _warn_unknown_pattern(profile: dict[str, Any], index_pattern: str, **es_kwargs: Any) -> None:
+    """Warn that a pattern matches no index, and name the patterns that exist."""
+    try:
+        known = list(fetch_aliases(profile, **es_kwargs))
+    except (KibanaAgentError, requests.RequestException, ValueError):
+        known = []
+    close = difflib.get_close_matches(index_pattern, known, n=3, cutoff=0.4)
+    warn(
+        f"index pattern '{index_pattern}' matches no index, so every query returns 0."
+        f"{_suffix(close)} Run 'kibana-agent aliases' for the full list."
+    )
+
+
+def check_request(
+    profile: dict[str, Any],
+    index_pattern: str,
+    query: dict[str, Any] | None,
+    aggs: dict[str, Any] | None,
+    time_field: str | None,
+    *,
+    no_cache: bool = False,
+    **es_kwargs: Any,
+) -> None:
+    """
+    Warn before sending a request that cannot match: unknown index pattern,
+    unknown field, or a clause the field type does not support. Best effort
+    only, so a request that cannot be checked is sent unchanged.
+    """
+    try:
+        mapping = fetch_mapping(profile, index_pattern, no_cache=no_cache, **es_kwargs)
+    except (KibanaAgentError, requests.RequestException, ValueError):
+        return
+    types = _mapping_types(mapping)
+    if not types:
+        _warn_unknown_pattern(profile, index_pattern, **es_kwargs)
+        return
+
+    bad_time_field = bool(time_field) and time_field not in types
+    if bad_time_field:
+        detected = _detect_time_field(types)
+        fix = (
+            f"this index uses '{detected}' (pass --time-field {detected})"
+            if detected
+            else "this index has no date field, so a time filter cannot match"
+        )
+        warn(f"time field '{time_field}' is not in the mapping — {fix}")
+
+    query_refs: list[tuple[str, str]] = []
+    agg_refs: list[str] = []
+    _collect_query_fields(query, query_refs)
+    _collect_agg_fields(aggs, agg_refs)
+    if bad_time_field:  # reported above, and it appears in every time filter
+        query_refs = [ref for ref in query_refs if ref[0] != time_field]
+        agg_refs = [name for name in agg_refs if name != time_field]
+    for warning in _field_warnings(types, query_refs, agg_refs):
+        warn(warning)
+
+
+def diagnose_zero(
+    profile: dict[str, Any],
+    index_pattern: str,
+    time_range: str,
+    time_field: str,
+    **es_kwargs: Any,
+) -> None:
+    """
+    Explain a zero result: say whether the filter, the window, or the index is
+    empty. Runs only when a query returned nothing, so it costs nothing normally.
+    """
+
+    def count(body: dict[str, Any]) -> int | None:
+        try:
+            data = es(profile, "POST", f"{index_pattern}/_count", body, **es_kwargs)
+        except (KibanaAgentError, requests.RequestException, ValueError):
+            return None
+        return int(data.get("count", 0)) if isinstance(data, dict) else None
+
+    in_window = count({"query": _time_range_filter(time_range, time_field)})
+    if in_window is None:
+        return
+    if in_window > 0:
+        warn(
+            f"0 hits, but the last {time_range} holds {in_window:,} documents. "
+            f"The filter is the problem, not the window."
+        )
+        return
+
+    total = count({"query": {"match_all": {}}})
+    if total:
+        warn(
+            f"0 hits, and the last {time_range} is empty. The pattern holds "
+            f"{total:,} documents overall — widen --last, or check '{time_field}' "
+            f"is the right time field."
+        )
+    elif total == 0:
+        warn(
+            f"0 hits, and '{index_pattern}' holds no documents at all. "
+            f"Check the index pattern with 'kibana-agent aliases'."
+        )
+
+
+def _pattern_stats(
+    profile: dict[str, Any], pattern: str, types: dict[str, str], es_kwargs: dict[str, Any]
+) -> dict[str, Any]:
+    """
+    Summarise one index pattern: field count, time field, coverage, doc counts.
+    Coverage says whether the index is still live, which explains many zeros.
+    """
+    stats: dict[str, Any] = {}
+    if types:
+        stats["fields"] = len(types)
+        stats["aggregatable"] = len([n for n, t in types.items() if t in _AGGREGATABLE_TYPES])
+    time_field = _detect_time_field(types) if types else None
+    if time_field:
+        stats["time_field"] = time_field
+    body: dict[str, Any] = {"size": 0, "query": {"match_all": {}}, "aggregations": {}}
+    if time_field:
+        body["aggregations"]["first"] = {"min": {"field": time_field}}
+        body["aggregations"]["last"] = {"max": {"field": time_field}}
+        body["aggregations"]["recent"] = {"filter": {"range": {time_field: {"gte": "now-1h"}}}}
+    try:
+        data = es(profile, "POST", f"{pattern}/_search", body, **es_kwargs)
+    except (KibanaAgentError, requests.RequestException, ValueError):
+        return stats
+    if not isinstance(data, dict):
+        return stats
+    total = data.get("hits", {}).get("total", {})
+    stats["docs"] = total.get("value") if isinstance(total, dict) else total
+    aggs = data.get("aggregations", {})
+    for key in ("first", "last"):
+        value = aggs.get(key, {}).get("value_as_string")
+        if value:
+            stats[key] = value
+    if "recent" in aggs:
+        stats["docs_1h"] = aggs["recent"].get("doc_count", 0)
+    return stats
+
+
+def _cluster_info(profile: dict[str, Any], es_kwargs: dict[str, Any]) -> dict[str, str]:
+    """Report the ES version, which decides what query syntax the cluster accepts."""
+    try:
+        root = es(profile, "GET", "/", **es_kwargs)
+    except (KibanaAgentError, requests.RequestException, ValueError):
+        return {}
+    if not isinstance(root, dict):
+        return {}
+    version = root.get("version", {})
+    number = version.get("number") if isinstance(version, dict) else None
+    return {"version": str(number)} if number else {}
 
 
 def _build_must(
     time_range: str | None,
     extra_query: str | dict[str, Any] | None,
     kql: str | None,
-    time_field: str = "@timestamp",
+    time_field: str = DEFAULT_TIME_FIELD,
 ) -> list[dict[str, Any]]:
     must: list[dict[str, Any]] = []
     if time_range:
@@ -773,25 +1245,32 @@ def op_search(
     extra_query: str | dict[str, Any] | None = None,
     kql: str | None = None,
     size: int = DEFAULT_SIZE,
-    sort: str = DEFAULT_SORT,
+    sort: str | None = None,
     fields: list[str] | None = None,
     aggs: dict[str, Any] | None = None,
     max_source_len: int = MAX_SOURCE_LEN,
+    time_field: str = DEFAULT_TIME_FIELD,
+    hints: bool = True,
     **es_kwargs: Any,
 ) -> dict[str, Any]:
     """Search recent logs in an index pattern."""
     body: dict[str, Any] = {
-        "query": {"bool": {"must": _build_must(time_range, extra_query, kql)}},
+        "query": {"bool": {"must": _build_must(time_range, extra_query, kql, time_field)}},
         "size": size,
     }
-    sort_key, _, sort_order = sort.partition(":")
+    sort_key, _, sort_order = (sort or f"{time_field}:desc").partition(":")
     body["sort"] = [{sort_key: sort_order or "desc"}]
     if fields:
         body["_source"] = fields
     if aggs is not None:
         body["aggregations"] = aggs
+    if hints:
+        check_request(profile, index_pattern, body["query"], aggs, time_field, **es_kwargs)
     data = es(profile, "POST", f"{index_pattern}/_search", body, **es_kwargs)
-    return _format_search_result(data, fields, max_source_len)  # type: ignore[arg-type]
+    result = _format_search_result(data, fields, max_source_len)  # type: ignore[arg-type]
+    if hints and result["total"] == 0 and (extra_query or kql):
+        diagnose_zero(profile, index_pattern, time_range, time_field, **es_kwargs)
+    return result
 
 
 def op_count(
@@ -801,12 +1280,19 @@ def op_count(
     time_range: str = DEFAULT_TIME_RANGE,
     extra_query: str | dict[str, Any] | None = None,
     kql: str | None = None,
+    time_field: str = DEFAULT_TIME_FIELD,
+    hints: bool = True,
     **es_kwargs: Any,
 ) -> int:
     """Count documents matching a query."""
-    body = {"query": {"bool": {"must": _build_must(time_range, extra_query, kql)}}}
-    data = es(profile, "POST", f"{index_pattern}/_count", body, **es_kwargs)
-    return int(data.get("count", 0))  # type: ignore[union-attr]
+    query = {"bool": {"must": _build_must(time_range, extra_query, kql, time_field)}}
+    if hints:
+        check_request(profile, index_pattern, query, None, time_field, **es_kwargs)
+    data = es(profile, "POST", f"{index_pattern}/_count", {"query": query}, **es_kwargs)
+    total = int(data.get("count", 0))  # type: ignore[union-attr]
+    if hints and total == 0 and (extra_query or kql):
+        diagnose_zero(profile, index_pattern, time_range, time_field, **es_kwargs)
+    return total
 
 
 def op_histogram(
@@ -817,7 +1303,8 @@ def op_histogram(
     interval: str = "5m",
     extra_query: str | dict[str, Any] | None = None,
     kql: str | None = None,
-    time_field: str = "@timestamp",
+    time_field: str = DEFAULT_TIME_FIELD,
+    hints: bool = True,
     **es_kwargs: Any,
 ) -> dict[str, Any]:
     """Date histogram aggregation of doc counts."""
@@ -834,6 +1321,10 @@ def op_histogram(
             }
         },
     }
+    if hints:
+        check_request(
+            profile, index_pattern, body["query"], body["aggregations"], time_field, **es_kwargs
+        )
     data = es(profile, "POST", f"{index_pattern}/_search", body, **es_kwargs)
     buckets = data.get("aggregations", {}).get("t", {}).get("buckets", [])  # type: ignore[union-attr]
     total = data.get("hits", {}).get("total", {})  # type: ignore[union-attr]
@@ -859,49 +1350,50 @@ def op_context(
     Cached for ``CACHE_TTL_CONTEXT`` seconds. Pass ``refresh=True`` to force a
     fresh fetch.
     """
+    notes = profile_notes(profile)
+    if not notes:
+        warn(
+            f"No notes for '{profile_label(profile)}' yet. Once you know which index serves "
+            f"which application, or which field carries a value, record it:\n"
+            f"  kibana-agent profile note {profile_label(profile)} <key>=<value>"
+        )
     if not refresh and not no_cache:
-        cached = cache_get("context", CACHE_TTL_CONTEXT)
+        cached = cache_get(profile, "context", CACHE_TTL_CONTEXT)
         if cached is not None:
-            return cached  # type: ignore[no-any-return]
+            return _with_notes(cached, notes)
 
     raw = es(profile, "GET", "_aliases", **es_kwargs)
     aliases_data = _parse_aliases(raw)  # type: ignore[arg-type]
-    cache_put("aliases", aliases_data)
+    cache_put(profile, "aliases", aliases_data)
     prefixes = _extract_prefixes(raw)  # type: ignore[arg-type]
 
     patterns = [p.strip() for p in indices.split(",")] if indices else prefixes[:5]
 
     mappings: dict[str, Any] = {}
-    counts: dict[str, int] = {}
+    stats: dict[str, Any] = {}
     for pattern in patterns:
+        types: dict[str, str] = {}
         try:
-            mapping = fetch_mapping(
-                profile, pattern, no_cache=refresh or no_cache, **es_kwargs
-            )
-            mappings[pattern] = next(iter(mapping.values()))
+            mapping = fetch_mapping(profile, pattern, no_cache=refresh or no_cache, **es_kwargs)
+            types = _mapping_types(mapping)
+            mappings[pattern] = _trim_fields(next(iter(mapping.values())), pattern)
         except KibanaAgentError:
             pass
-        try:
-            count_result = es(
-                profile,
-                "POST",
-                f"{pattern}/_count",
-                {"query": _time_range_filter("1h")},
-                **es_kwargs,
-            )
-            counts[pattern] = int(count_result.get("count", 0))  # type: ignore[union-attr]
-        except (KibanaAgentError, Exception):
-            pass
+        summary = _pattern_stats(profile, pattern, types, es_kwargs)
+        if summary:
+            stats[pattern] = summary
 
     ctx = {
         "ts": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "scope": _scope(profile),
+        "cluster": _cluster_info(profile, es_kwargs),
         "prefixes": prefixes,
         "aliases": aliases_data,
+        "indices": stats,
         "mappings": mappings,
-        "counts_1h": counts,
     }
-    cache_put("context", ctx)
-    return ctx
+    cache_put(profile, "context", ctx)
+    return _with_notes(ctx, notes)
 
 
 def op_mapping(
@@ -1044,6 +1536,32 @@ def op_discover_url(
         "url": url,
         "data_view_hint": f"Select the '{index_pattern}' data view manually in Kibana.",
     }
+
+
+def op_set_notes(profile: dict[str, Any], facts: dict[str, str]) -> dict[str, str]:
+    """
+    Add facts to a profile's notes and return the full set.
+    An empty value removes that note.
+    """
+    label = profile_label(profile)
+    config = load_config()
+    profile_data = config.get("profiles", {}).get(label)
+    if profile_data is None:
+        raise ProfileNotFoundError(
+            f"Profile '{label}' is not in the config file, so notes cannot be saved."
+        )
+    notes: dict[str, str] = dict(profile_data.get("notes", {}))
+    for key, value in facts.items():
+        if value:
+            notes[key] = value
+        else:
+            notes.pop(key, None)
+    if notes:
+        profile_data["notes"] = notes
+    else:
+        profile_data.pop("notes", None)
+    save_config(config)
+    return notes
 
 
 def op_list_profiles() -> list[dict[str, Any]]:

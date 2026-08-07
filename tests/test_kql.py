@@ -10,9 +10,7 @@ class TestFieldMatch:
         assert kql_to_es("level:ERROR") == {"match": {"level": "ERROR"}}
 
     def test_dotted_field(self) -> None:
-        assert kql_to_es("kubernetes.labels.app:web") == {
-            "match": {"kubernetes.labels.app": "web"}
-        }
+        assert kql_to_es("kubernetes.labels.app:web") == {"match": {"kubernetes.labels.app": "web"}}
 
     def test_hyphenated_value(self) -> None:
         assert kql_to_es("app:my-service") == {"match": {"app": "my-service"}}
@@ -23,19 +21,13 @@ class TestFieldMatch:
 
 class TestFieldPhrase:
     def test_quoted_value(self) -> None:
-        assert kql_to_es('level:"error message"') == {
-            "match_phrase": {"level": "error message"}
-        }
+        assert kql_to_es('level:"error message"') == {"match_phrase": {"level": "error message"}}
 
     def test_escape_in_quoted(self) -> None:
-        assert kql_to_es('msg:"line1\\nline2"') == {
-            "match_phrase": {"msg": "line1\nline2"}
-        }
+        assert kql_to_es('msg:"line1\\nline2"') == {"match_phrase": {"msg": "line1\nline2"}}
 
     def test_wildcard_field_quoted(self) -> None:
-        assert kql_to_es('*:"exact phrase"') == {
-            "query_string": {"query": '"exact phrase"'}
-        }
+        assert kql_to_es('*:"exact phrase"') == {"query_string": {"query": '"exact phrase"'}}
 
 
 class TestExists:
@@ -51,9 +43,7 @@ class TestWildcard:
         assert kql_to_es("msg:*error") == {"wildcard": {"msg": {"value": "*error"}}}
 
     def test_middle_star(self) -> None:
-        assert kql_to_es("path:/api/*/health") == {
-            "wildcard": {"path": {"value": "/api/*/health"}}
-        }
+        assert kql_to_es("path:/api/*/health") == {"wildcard": {"path": {"value": "/api/*/health"}}}
 
     def test_wildcard_field_with_wildcard_value(self) -> None:
         assert kql_to_es("*:err*") == {"query_string": {"query": "err*"}}
@@ -225,9 +215,7 @@ class TestValueList:
 
     def test_and_list(self) -> None:
         result = kql_to_es("tags:(a and b)")
-        assert result == {
-            "bool": {"filter": [{"match": {"tags": "a"}}, {"match": {"tags": "b"}}]}
-        }
+        assert result == {"bool": {"filter": [{"match": {"tags": "a"}}, {"match": {"tags": "b"}}]}}
 
     def test_not_in_list(self) -> None:
         result = kql_to_es("status:(200 or not 500)")

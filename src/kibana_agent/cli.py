@@ -57,7 +57,7 @@ from kibana_agent import client
 from kibana_agent.client import (
     CACHE_DIR,
     DEFAULT_SIZE,
-    DEFAULT_SORT,
+    DEFAULT_TIME_FIELD,
     DEFAULT_TIME_RANGE,
     DEFAULT_TIMEOUT,
     MAX_SOURCE_LEN,
@@ -67,7 +67,7 @@ from kibana_agent.client import (
 
 
 def emit(data: Any, fmt: str) -> None:
-    if fmt == "compact" and isinstance(data, dict) and "hits" in data:
+    if fmt == "compact" and isinstance(data, dict) and isinstance(data.get("hits"), list):
         meta = {k: v for k, v in data.items() if k != "hits"}
         if meta:
             click.echo("#" + json.dumps(meta, ensure_ascii=False, separators=(",", ":")))
@@ -130,7 +130,7 @@ def _es_kwargs(
 
 
 @click.group()
-@click.version_option("0.6.0")
+@click.version_option(package_name="kibana-agent")
 def cli() -> None:
     """Read-only Kibana/ES CLI for AI agents."""
 
@@ -326,6 +326,64 @@ def profile_use(name: str) -> None:
     config["active"] = name
     client.save_config(config)
     click.echo(f"Active profile: {name}")
+
+
+@profile.command("note")
+@click.argument("name")
+@click.argument("pairs", nargs=-1)
+@click.option("--delete", "delete_keys", multiple=True, help="Remove a note (repeatable)")
+def profile_note(name: str, pairs: tuple[str, ...], delete_keys: tuple[str, ...]) -> None:
+    """
+    Store facts the cluster cannot tell you, such as which index holds which app.
+
+    \b
+    Examples:
+      profile note prd                                   # dump every note
+      profile note prd app-logs="logs-app-*"             # set one
+      profile note prd app-logs="x" status-field="y"     # set many in one call
+      profile note prd --delete app-logs                 # remove one
+
+    Reading always returns every note at once, so never ask for keys one at a
+    time. Notes appear at the top of `context`, live in the config file, and
+    survive `cache-clear`. Keep them short. Do not store secrets, a copy of the
+    mapping, or the findings of an investigation.
+    """
+    config = client.load_config()
+    profile_data = config.get("profiles", {}).get(name)
+    if profile_data is None:
+        click.echo(f"Profile '{name}' not found. Run: profile list", err=True)
+        sys.exit(1)
+    notes: dict[str, str] = dict(profile_data.get("notes", {}))
+
+    if not pairs and not delete_keys:
+        click.echo(json.dumps(notes, indent=2, ensure_ascii=False))
+        return
+
+    changes: list[str] = []
+    for key in delete_keys:
+        if notes.pop(key, None) is None:
+            click.echo(f"Profile '{name}' has no note '{key}'.", err=True)
+            sys.exit(1)
+        changes.append(f"removed '{key}'")
+
+    for pair in pairs:
+        key, sep, value = pair.partition("=")
+        if not sep or not key:
+            click.echo(
+                f"Error: expected key=value, got '{pair}'. "
+                f"To read the notes run: profile note {name}",
+                err=True,
+            )
+            sys.exit(1)
+        notes[key] = value
+        changes.append(f"set '{key}'")
+
+    if notes:
+        profile_data["notes"] = notes
+    else:
+        profile_data.pop("notes", None)
+    client.save_config(config)
+    click.echo(f"{', '.join(changes)} on '{name}'")
 
 
 @profile.command("delete")
@@ -578,6 +636,8 @@ def fields(
 @click.option("--last", "time_range", default=DEFAULT_TIME_RANGE)
 @click.option("-q", "--query", "extra_query", default=None)
 @click.option("--kql", "kql_query", default=None, help="KQL filter")
+@click.option("--time-field", "time_field", default=DEFAULT_TIME_FIELD)
+@click.option("--no-hints", "no_hints", is_flag=True, default=False)
 @common
 @handle_errors
 def count(
@@ -585,6 +645,8 @@ def count(
     time_range: str,
     extra_query: str | None,
     kql_query: str | None,
+    time_field: str,
+    no_hints: bool,
     prof_name: str | None,
     timeout: int,
     dry_run: bool,
@@ -602,6 +664,8 @@ def count(
         time_range=time_range,
         extra_query=extra_query,
         kql=kql_query,
+        time_field=time_field,
+        hints=not no_hints and not dry_run,
         **_es_kwargs(timeout, dry_run, explain, filter_path),
     )
     click.echo(n)
@@ -614,9 +678,11 @@ def count(
 @click.option("-q", "--query", "extra_query", default=None)
 @click.option("--kql", "kql_query", default=None, help="KQL filter")
 @click.option("-f", "--fields", "field_csv", default=None)
-@click.option("--sort", "sort_field", default=DEFAULT_SORT)
+@click.option("--sort", "sort_field", default=None)
 @click.option("--aggs", default=None)
+@click.option("--time-field", "time_field", default=DEFAULT_TIME_FIELD)
 @click.option("--max-source-len", "max_source_len", default=MAX_SOURCE_LEN, type=int)
+@click.option("--no-hints", "no_hints", is_flag=True, default=False)
 @common
 @handle_errors
 def search(
@@ -626,9 +692,11 @@ def search(
     extra_query: str | None,
     kql_query: str | None,
     field_csv: str | None,
-    sort_field: str,
+    sort_field: str | None,
     aggs: str | None,
+    time_field: str,
     max_source_len: int,
+    no_hints: bool,
     prof_name: str | None,
     timeout: int,
     dry_run: bool,
@@ -652,6 +720,8 @@ def search(
         fields=field_list,
         aggs=json.loads(aggs) if aggs else None,
         max_source_len=max_source_len,
+        time_field=time_field,
+        hints=not no_hints and not dry_run,
         **_es_kwargs(timeout, dry_run, explain, filter_path),
     )
     emit(result, fmt)
@@ -735,7 +805,8 @@ def tail(
 @click.option("--interval", default="5m")
 @click.option("-q", "--query", "extra_query", default=None)
 @click.option("--kql", "kql_query", default=None, help="KQL filter")
-@click.option("--field", "time_field", default="@timestamp")
+@click.option("--field", "--time-field", "time_field", default=DEFAULT_TIME_FIELD)
+@click.option("--no-hints", "no_hints", is_flag=True, default=False)
 @common
 @handle_errors
 def histogram(
@@ -745,6 +816,7 @@ def histogram(
     extra_query: str | None,
     kql_query: str | None,
     time_field: str,
+    no_hints: bool,
     prof_name: str | None,
     timeout: int,
     dry_run: bool,
@@ -764,6 +836,7 @@ def histogram(
         extra_query=extra_query,
         kql=kql_query,
         time_field=time_field,
+        hints=not no_hints and not dry_run,
         **_es_kwargs(timeout, dry_run, explain, filter_path),
     )
     emit(result, fmt)
@@ -827,12 +900,52 @@ def raw(
 
 
 @cli.command("cache-clear")
+@click.option(
+    "--profile",
+    "prof_name",
+    default=None,
+    envvar="KIBANA_AGENT_PROFILE",
+    help="Profile to clear (default: active)",
+)
+@click.option("--all", "clear_all", is_flag=True, default=False, help="Clear every profile")
+@click.option("--data-only", is_flag=True, default=False, help="Keep cached credentials")
+@click.option("--creds-only", is_flag=True, default=False, help="Keep cached data")
 @handle_errors
-def cache_clear() -> None:
-    """Wipe all cached data (including OS keyring credential cache)."""
-    client.cached_creds_clear()
-    click.echo(f"Cleared {client.cache_clear_all()} files from {CACHE_DIR}")
-    click.echo("Cleared cached credentials from OS keyring.")
+def cache_clear(prof_name: str | None, clear_all: bool, data_only: bool, creds_only: bool) -> None:
+    """
+    Wipe cached data and credentials for one profile (default: the active one).
+
+    \b
+    Examples:
+      cache-clear                  # active profile: cached data + credentials
+      cache-clear --profile stg    # that profile only
+      cache-clear --creds-only     # re-authenticate, keep the cached mappings
+      cache-clear --all            # every profile
+
+    Profile notes live in the config file and are never touched.
+    """
+    if data_only and creds_only:
+        click.echo("Error: --data-only and --creds-only are mutually exclusive.", err=True)
+        sys.exit(1)
+    if clear_all and prof_name:
+        click.echo("Error: --all and --profile are mutually exclusive.", err=True)
+        sys.exit(1)
+
+    if clear_all:
+        if not creds_only:
+            click.echo(f"Cleared {client.cache_clear_all()} cached files from {CACHE_DIR}")
+        if not data_only:
+            client.cached_creds_clear()
+            click.echo("Cleared cached credentials for every profile.")
+        return
+
+    prof = client.resolve_profile(prof_name)
+    label = client.profile_label(prof)
+    if not creds_only:
+        click.echo(f"Cleared {client.cache_clear_profile(prof)} cached files for '{label}'")
+    if not data_only:
+        client.cached_creds_clear_profile(prof)
+        click.echo(f"Cleared cached credentials for '{label}'.")
 
 
 @cli.command()
@@ -891,17 +1004,56 @@ All write operations are blocked. Safe to use in automated pipelines.
   Options: --kql, --lucene, -f, --last.
 - `kibana-agent raw GET|POST <es-path> [--body <json>]` — arbitrary
   read-only ES request through the Kibana proxy.
-- `kibana-agent cache-clear` — wipe cached data.
+- `kibana-agent profile note <profile> [<key>=<value> ...]` — store facts the
+  cluster cannot tell you, such as which index holds which application. With
+  no pair it dumps every note; `--delete <key>` removes one. Notes appear at
+  the top of `context` and survive `cache-clear`.
+- `kibana-agent cache-clear` — wipe cached data and credentials for the active
+  profile. `--profile <name>` targets another, `--all` covers every profile,
+  `--creds-only` re-authenticates but keeps the cached mappings, `--data-only`
+  does the opposite. Profile notes are never touched.
 - `kibana-agent mcp` — run as an MCP stdio server (Claude Code, Cursor, ...).
 
 ## Typical agent workflow
 
-1. `kibana-agent context` — learn what indices and fields exist.
+1. `kibana-agent context` — read the profile notes first, then learn what
+   indices and fields exist. The notes say which index to use; never guess one
+   when a note names it. `context` also reports, per pattern, the detected
+   `time_field`, the first and last document time, and how many fields exist.
 2. `kibana-agent search <idx> --last 1h -n 3` — sample recent docs.
 3. Refine: add `-q`, `-f`, `--aggs`, adjust `--last` and `-n`.
 4. `kibana-agent histogram <idx> --last 6h --interval 10m` — spot trends.
 5. `kibana-agent count <idx> --last 1h -q '{"match":{"level":"ERROR"}}'`
    — quantify issues.
+6. Record what you worked out: `kibana-agent profile note <profile>
+   app-logs="<pattern>"`.
+
+## Hints on stderr — read them
+
+`search`, `count`, and `histogram` check the request against the mapping
+before sending it, and explain an empty result afterwards. Everything goes to
+stderr; the request still runs. Use `--no-hints` to switch it off.
+
+Before the request:
+  - a field in `-q` or `--aggs` that the mapping lacks, with the closest
+    matching field names;
+  - `term`/`terms` on an analyzed text field, naming the `.keyword` sibling
+    when one exists;
+  - an aggregation on a text field, which has no doc values;
+  - `--time-field` missing from the mapping, naming the date field the index
+    really uses;
+  - an index pattern that matches no index at all.
+
+After the request:
+  - `0 hits, but the last <window> holds N documents` — your filter is wrong,
+    not the window;
+  - `0 hits, and the last <window> is empty` — widen `--last`;
+  - `holds no documents at all` — wrong index pattern;
+  - `N of M shards failed` — the counts are partial, do not report them as
+    totals;
+  - documents cut at `--max-source-len`, which names the flag to raise.
+
+A zero with no note and a clean exit is a real zero.
 
 ## Output format
 

@@ -60,8 +60,9 @@ def search_logs(
     kql: str | None = None,
     size: int = 5,
     fields: list[str] | None = None,
-    sort: str = "@timestamp:desc",
+    sort: str | None = None,
     aggs: dict[str, Any] | None = None,
+    time_field: str = "@timestamp",
     profile: str | None = None,
 ) -> dict[str, Any]:
     """Search recent logs in a Kibana index pattern.
@@ -83,6 +84,7 @@ def search_logs(
         sort=sort,
         fields=fields,
         aggs=aggs,
+        time_field=time_field,
     )
 
 
@@ -93,12 +95,15 @@ def count_documents(
     last: str = "1h",
     query: str | None = None,
     kql: str | None = None,
+    time_field: str = "@timestamp",
     profile: str | None = None,
 ) -> dict[str, Any]:
     """Count documents matching a query in an index pattern over a time range."""
     prof = _resolve(profile)
     idx = client._resolve_index(prof, index_pattern)
-    n = client.op_count(prof, idx, time_range=last, extra_query=query, kql=kql)
+    n = client.op_count(
+        prof, idx, time_range=last, extra_query=query, kql=kql, time_field=time_field
+    )
     return {"count": n, "index": idx, "last": last}
 
 
@@ -243,9 +248,7 @@ def get_discover_url(
     """Build a Kibana Discover deep link with a pre-filled query and time range."""
     prof = _resolve(profile)
     idx = client._resolve_index(prof, index_pattern)
-    return client.op_discover_url(
-        prof, idx, time_range=last, kql=kql, lucene=lucene, fields=fields
-    )
+    return client.op_discover_url(prof, idx, time_range=last, kql=kql, lucene=lucene, fields=fields)
 
 
 @mcp.tool()
@@ -257,6 +260,23 @@ def list_profiles() -> dict[str, Any]:
     as the ``profile`` argument to other tools.
     """
     return {"profiles": client.op_list_profiles()}
+
+
+@mcp.tool()
+@safe
+def remember_fact(facts: dict[str, str], profile: str | None = None) -> dict[str, Any]:
+    """Store facts about a cluster that the cluster itself cannot tell you.
+
+    Use this the moment you work something out that the next session would
+    otherwise rediscover: which index pattern holds an application's logs,
+    which field carries a value whose name is not obvious, or a cluster
+    behaviour no mapping shows. Pass several facts in one call.
+
+    The facts come back at the top of ``get_context``. Do not store a copy of
+    the mapping (it goes stale), the findings of an investigation, or secrets.
+    """
+    prof = _resolve(profile)
+    return {"notes": client.op_set_notes(prof, facts), "profile": client.profile_label(prof)}
 
 
 def run() -> None:
