@@ -648,18 +648,6 @@ class TestDetectTimeField:
         assert client._detect_time_field({"msg": "text"}) is None
 
 
-class TestTrimFields:
-    def test_short_mapping_is_untouched(self) -> None:
-        fields = {"a": "long", "b": "text"}
-        assert client._trim_fields(fields, "idx-*") == fields
-
-    def test_long_mapping_is_capped_with_a_pointer(self) -> None:
-        fields = {f"f{i:03d}": "long" for i in range(100)}
-        trimmed = client._trim_fields(fields, "idx-*")
-        assert len(trimmed) == client.MAX_CONTEXT_FIELDS + 1
-        assert "40 more fields" in trimmed["…"]
-
-
 class TestScopeAndNotes:
     def test_scope_reports_profile_only_by_default(self) -> None:
         assert client._scope({"_name": "prd"}) == {"profile": "prd"}
@@ -936,3 +924,52 @@ class TestSelectPatterns:
         chosen = client._select_patterns(notes, INDEX_NAMES, INDEX_PREFIXES)
         assert chosen == INDEX_PREFIXES[: client.MAX_CONTEXT_PATTERNS]
         assert "context --indices" in capsys.readouterr().err
+
+
+class TestTrimFields:
+    def test_short_mapping_is_untouched(self) -> None:
+        fields = {"a": "long", "b": "text"}
+        assert client._trim_fields(fields, "idx-*") == fields
+
+    def test_a_narrow_index_is_listed_in_full(self) -> None:
+        fields = {f"f{i}": "keyword" for i in range(client.MAX_CONTEXT_FIELDS)}
+        assert client._trim_fields(fields, "logs-*") == fields
+
+    def test_a_wide_index_is_described_by_namespace(self) -> None:
+        fields = {"@timestamp": "date"}
+        fields.update({f"logs.ctx.f{i}": "keyword" for i in range(200)})
+        fields.update({f"kubernetes.pod.f{i}": "keyword" for i in range(20)})
+        out = client._trim_fields(fields, "logs-*")
+        assert out["@timestamp"] == "date"
+        assert out["logs.ctx.*"] == "200 fields"
+        assert out["kubernetes.pod.*"] == "20 fields"
+        assert out["…"] == "221 fields in total — run: fields logs-* '<glob>'"
+
+    def test_a_text_field_with_a_keyword_sibling_keeps_its_type(self) -> None:
+        fields = {"message": "text", "message.keyword": "keyword"}
+        fields.update({f"logs.f{i}": "keyword" for i in range(80)})
+        out = client._trim_fields(fields, "logs-*")
+        assert out["message"] == "text +keyword"
+
+    def test_a_small_namespace_is_not_split(self) -> None:
+        fields = {f"a.b{i}": "keyword" for i in range(5)}
+        fields.update({f"c.d{i}": "keyword" for i in range(80)})
+        out = client._trim_fields(fields, "logs-*")
+        assert out["a.*"] == "5 fields"
+
+    def test_a_flat_index_falls_back_to_a_capped_sample(self) -> None:
+        fields = {f"field{i}": "keyword" for i in range(300)}
+        out = client._trim_fields(fields, "logs-*")
+        assert len(out) == client.MAX_CONTEXT_FIELDS + 1
+        assert out["…"] == "300 fields in total — run: fields logs-* '<glob>'"
+
+    def test_the_biggest_namespace_survives_the_cap(self) -> None:
+        fields = {f"flat{i}": "keyword" for i in range(300)}
+        fields.update({f"big.f{i}": "keyword" for i in range(50)})
+        out = client._trim_fields(fields, "logs-*")
+        assert out["big.*"] == "50 fields"
+
+    def test_nesting_stops_at_the_depth_limit(self) -> None:
+        fields = {f"a.b.c{i}": "keyword" for i in range(80)}
+        out = client._trim_fields(fields, "logs-*")
+        assert out["a.b.*"] == "80 fields"

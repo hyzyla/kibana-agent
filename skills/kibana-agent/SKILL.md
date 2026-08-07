@@ -64,7 +64,20 @@ kibana-agent agent-help
    - `cluster` — the ES version, which decides what query syntax the cluster accepts.
    - `indices` — per pattern: field count, how many are aggregatable, the detected
      `time_field`, total docs, `first`/`last` document time, and docs in the last hour.
-   - `mappings` — field types, capped per pattern; use `fields <pattern> '<glob>'` for the rest.
+   - `mappings` — field types per pattern. A narrow index is listed in full. A wide one is
+     summarised by namespace instead:
+
+     ```json
+     "logs.message": "text +keyword",
+     "logs.exception.*": "6 fields",
+     "logs.ctx.*": "1307 fields",
+     "…": "1439 fields in total — run: fields <pattern> '<glob>'"
+     ```
+
+     A key ending in `.*` is a **namespace, not a field** — never put it in a query. It tells you
+     where to look: `fields <pattern> 'logs.ctx.*user*'` lists what is inside. `text +keyword`
+     means the field is analyzed **and** has a `.keyword` sibling, so `match_phrase` works on the
+     name as written and `term` works on `<name>.keyword`.
 
    `indices` and `mappings` cover five patterns, not all of them. **The patterns named in your
    notes come first**, so a note like `edo-logs="k8s-edo-*"` puts that mapping in the first call.

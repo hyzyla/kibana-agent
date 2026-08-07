@@ -83,6 +83,9 @@ MAX_RESPONSE_HITS = 500
 MAX_RESPONSE_BYTES = 2_000_000
 MAX_CONTEXT_FIELDS = 60
 MAX_CONTEXT_PATTERNS = 5
+SHAPE_SPLIT_MIN = 12
+SHAPE_MAX_DEPTH = 2
+SHAPE_MIN_COMPRESSION = 2
 CACHE_TTL_ALIASES = 86400
 CACHE_TTL_MAPPING = 86400
 CACHE_TTL_CONTEXT = 86400
@@ -1049,13 +1052,60 @@ def _field_warnings(
     return warnings
 
 
+def _field_shape(fields: dict[str, str], names: list[str], depth: int) -> dict[str, str]:
+    """
+    Describe a group of fields by namespace, splitting a namespace that is
+    still large. A single field keeps its type; a group reports its size.
+    """
+    groups: dict[str, list[str]] = {}
+    for name in names:
+        groups.setdefault(".".join(name.split(".")[: depth + 1]), []).append(name)
+    out: dict[str, str] = {}
+    for head, members in groups.items():
+        if len(members) == 1:
+            out[members[0]] = fields[members[0]]
+        elif members == [head, f"{head}.keyword"]:
+            out[head] = f"{fields[head]} +keyword"
+        elif len(members) > SHAPE_SPLIT_MIN and depth + 1 < SHAPE_MAX_DEPTH:
+            nested = _field_shape(fields, members, depth + 1)
+            if len(nested) * SHAPE_MIN_COMPRESSION <= len(members):
+                out.update(nested)
+            else:
+                out[f"{head}.*"] = f"{len(members)} fields"
+        else:
+            out[f"{head}.*"] = f"{len(members)} fields"
+    return out
+
+
+def _biggest_first(shape: dict[str, str]) -> dict[str, str]:
+    """
+    Keep the largest namespaces when even the shape is too long. An index whose
+    fields carry no common prefix has no shape to show, so this falls back to a
+    sample, but a sample that leads with whatever structure does exist.
+    """
+
+    def rank(item: tuple[str, str]) -> tuple[int, str]:
+        key, value = item
+        count = int(value.split()[0]) if key.endswith(".*") else 1
+        return -count, key
+
+    return dict(sorted(shape.items(), key=rank)[:MAX_CONTEXT_FIELDS])
+
+
 def _trim_fields(fields: dict[str, str], pattern: str) -> dict[str, str]:
-    """Cap an inline field list, so one wide index does not fill the output."""
+    """
+    Keep an inline field list short, so one wide index does not fill the output.
+    A narrow index is listed in full. A wide one is described by namespace: an
+    alphabetical slice of 2,000 fields shows one corner and hides the rest,
+    while the namespaces say where to look next.
+    """
     if len(fields) <= MAX_CONTEXT_FIELDS:
         return fields
-    kept = dict(sorted(fields.items())[:MAX_CONTEXT_FIELDS])
-    kept["…"] = f"{len(fields) - MAX_CONTEXT_FIELDS} more fields — run: fields {pattern} '<glob>'"
-    return kept
+    shape = _field_shape(fields, sorted(fields), 0)
+    if len(shape) > MAX_CONTEXT_FIELDS:
+        shape = _biggest_first(shape)
+    shape["…"] = f"{len(fields)} fields in total — run: fields {pattern} '<glob>'"
+    return shape
 
 
 def _with_notes(ctx: dict[str, Any], notes: dict[str, str]) -> dict[str, Any]:

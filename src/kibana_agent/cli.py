@@ -1086,6 +1086,10 @@ All write operations are blocked. Safe to use in automated pipelines.
    It describes five patterns in full, and a pattern named in the notes comes
    before one picked alphabetically — so writing a note also improves what the
    next `context` shows. Use `--indices '<a>,<b>'` to ask for others.
+   In `mappings`, a wide index is summarised by namespace: a key ending in
+   `.*` is a namespace and its value is a field count, so never query it —
+   run `fields <pattern> '<namespace>*'` to see inside. A type of
+   `text +keyword` means the field has a `.keyword` sibling.
 2. `kibana-agent search <idx> --last 1h -n 3` — sample recent docs.
 3. Refine: add `-q`, `-f`, `--aggs`, adjust `--last` and `-n`.
 4. `kibana-agent histogram <idx> --last 6h --interval 10m` — spot trends.
