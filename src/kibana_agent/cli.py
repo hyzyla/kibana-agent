@@ -1121,6 +1121,9 @@ After the request:
     not the window;
   - `0 hits, and the last <window> is empty` — widen `--last`;
   - `holds no documents at all` — wrong index pattern;
+  - `aggregation 'x' is empty: none of the N matching documents has '<field>'`
+    — the filter selected documents without that field. A `must_not` clause
+    on a field also matches every document that lacks it;
   - `N of M shards failed ...: <reason>` — the result is incomplete, do not
     report its counts. The reason names the broken part of the request, and
     the zero-hint above is not printed, because the filter is not the cause;

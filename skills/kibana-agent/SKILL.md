@@ -221,6 +221,19 @@ Aggregate on `keyword`, numeric, boolean, or date fields. When only a text field
 pull documents with `-f` and group them yourself, or run repeated `count` calls with
 `match_phrase`.
 
+An aggregation on a correct `keyword` field can still return no buckets while `total` is not zero.
+That means the matching documents do not carry the field at all. The CLI checks for this and
+warns:
+
+```
+Warning: aggregation 'lvl' is empty: none of the 3,667 matching documents has 'level.keyword'.
+```
+
+The common cause is `must_not`: a clause such as `must_not term level.keyword=info` also matches
+every document that has no `level` field, such as an unparsed startup banner. Read those documents
+with `-f` before you conclude anything from the empty buckets, or add
+`{"exists":{"field":"level.keyword"}}` to `-q` to keep only documents that have the field.
+
 In `date_histogram`, prefer a numeric UTC offset (`"+02:00"`) over an IANA name. Older clusters
 carry an older timezone database and reject newer zone names.
 

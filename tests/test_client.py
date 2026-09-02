@@ -451,6 +451,78 @@ class TestOpSearch:
         assert "filter is the problem" not in err
 
 
+class TestDiagnoseEmptyAggs:
+    @pytest.mark.parametrize(
+        ("agg", "empty"),
+        [
+            ({"buckets": []}, True),
+            ({"buckets": [{"key": "info", "doc_count": 3}]}, False),
+            ({"value": None}, True),
+            ({"value": 3.5}, False),
+            ({"doc_count": 0}, False),
+        ],
+    )
+    def test_agg_is_empty(self, agg: dict[str, Any], empty: bool) -> None:
+        assert client._agg_is_empty(agg) is empty
+
+    def _run(
+        self, monkeypatch: pytest.MonkeyPatch, buckets: list[dict[str, Any]], with_field: int
+    ) -> list[dict[str, Any]]:
+        responses = {
+            "logs-*/_search": {
+                "hits": {"total": {"value": 8}, "hits": []},
+                "aggregations": {"lvl": {"buckets": buckets}},
+            },
+            "logs-*/_count": {"count": with_field},
+        }
+        bodies: list[dict[str, Any]] = []
+
+        def post(url: str, **kwargs: Any) -> FakeResponse:
+            bodies.append({"path": kwargs["params"]["path"], **kwargs["json"]})
+            return FakeResponse(responses[kwargs["params"]["path"]])
+
+        monkeypatch.setattr(client.requests, "post", post)
+        monkeypatch.setattr(client, "check_request", lambda *a, **k: None)
+        op_search(
+            PLAIN_PROFILE,
+            "logs-*",
+            size=0,
+            extra_query='{"match":{"app":"crm"}}',
+            aggs={"lvl": {"terms": {"field": "level.keyword"}}},
+        )
+        return bodies
+
+    def test_no_buckets_with_matches_counts_the_field(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        bodies = self._run(monkeypatch, buckets=[], with_field=0)
+        assert [b["path"] for b in bodies] == ["logs-*/_search", "logs-*/_count"]
+        must = bodies[1]["query"]["bool"]["must"]
+        assert must[0] == bodies[0]["query"]
+        assert must[1] == {"exists": {"field": "level.keyword"}}
+        err = capsys.readouterr().err
+        assert (
+            "aggregation 'lvl' is empty: none of the 8 matching documents has 'level.keyword'"
+            in err
+        )
+        assert "filter is the problem" not in err
+
+    def test_no_buckets_although_the_field_exists(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._run(monkeypatch, buckets=[], with_field=5)
+        assert (
+            "although 5 of the 8 matching documents have 'level.keyword'" in capsys.readouterr().err
+        )
+
+    def test_buckets_present_stay_silent(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        bodies = self._run(monkeypatch, buckets=[{"key": "error", "doc_count": 8}], with_field=8)
+        assert [b["path"] for b in bodies] == ["logs-*/_search"]
+        assert capsys.readouterr().err == ""
+
+
 class TestParseSort:
     def test_default_sorts_the_time_field_newest_first(self) -> None:
         assert client._parse_sort(None, "ts") == ("ts", "desc")

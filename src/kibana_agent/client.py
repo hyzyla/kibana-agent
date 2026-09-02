@@ -1441,6 +1441,59 @@ def diagnose_zero(
         )
 
 
+def _agg_is_empty(agg: Any) -> bool:
+    """True for a bucket aggregation with no buckets, or a metric with no value."""
+    if not isinstance(agg, dict):
+        return False
+    return agg.get("buckets") == [] or ("value" in agg and agg["value"] is None)
+
+
+def diagnose_empty_aggs(
+    profile: dict[str, Any],
+    index_pattern: str,
+    query: dict[str, Any],
+    aggs: dict[str, Any],
+    data: dict[str, Any],
+    **es_kwargs: Any,
+) -> None:
+    """
+    Explain an aggregation that returned nothing although documents matched.
+    The usual cause is that the matched documents do not carry the field: a
+    filter on other fields, or a "must_not" on this one, selects them anyway.
+    """
+    total, capped = _read_total(data.get("hits", {}).get("total", {}))
+    if not isinstance(total, int) or total <= 0:
+        return
+    matched = f"at least {total:,}" if capped else f"{total:,}"
+    for name, agg in data.get("aggregations", {}).items():
+        if not _agg_is_empty(agg):
+            continue
+        fields: list[str] = []
+        _collect_agg_fields(aggs.get(name), fields)
+        if not fields:
+            continue
+        field = fields[0]
+        with_field = _count_or_none(
+            profile,
+            index_pattern,
+            {"bool": {"must": [query, {"exists": {"field": field}}]}},
+            **es_kwargs,
+        )
+        if with_field is None:
+            continue
+        if with_field == 0:
+            warn(
+                f"aggregation '{name}' is empty: none of the {matched} matching documents "
+                f"has '{field}'. Read them with -f to see what they hold, or add "
+                f'{{"exists":{{"field":"{field}"}}}} to -q.'
+            )
+        else:
+            warn(
+                f"aggregation '{name}' is empty, although {with_field:,} of the {matched} "
+                f"matching documents have '{field}'. Check the aggregation itself, not the data."
+            )
+
+
 def _pattern_stats(
     profile: dict[str, Any], pattern: str, types: dict[str, str], es_kwargs: dict[str, Any]
 ) -> dict[str, Any]:
@@ -1559,8 +1612,11 @@ def op_search(
         )
     data = es(profile, "POST", f"{index_pattern}/_search", body, **es_kwargs)
     result = _format_search_result(data, fields, max_source_len, expand_json)  # type: ignore[arg-type]
-    if hints and result["total"] == 0 and (extra_query or kql) and not _failed_shards(data):
-        diagnose_zero(profile, index_pattern, time_range, time_field, **es_kwargs)
+    if hints and not _failed_shards(data):
+        if result["total"] == 0 and (extra_query or kql):
+            diagnose_zero(profile, index_pattern, time_range, time_field, **es_kwargs)
+        elif aggs:
+            diagnose_empty_aggs(profile, index_pattern, body["query"], aggs, data, **es_kwargs)  # type: ignore[arg-type]
     return result
 
 
