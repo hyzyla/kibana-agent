@@ -10,6 +10,7 @@ from kibana_agent import client
 from kibana_agent.client import (
     BlockedRequestError,
     DryRunResult,
+    InvalidOptionError,
     KibanaApiError,
     ProfileNotFoundError,
     _guard,
@@ -408,6 +409,60 @@ class TestOpSearch:
         assert rec.last_json is not None
         assert rec.last_json["_source"] == ["a", "c"]
 
+    def test_sort_option_sets_field_and_order(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        rec = RequestRecorder({"hits": {"total": {"value": 0}, "hits": []}})
+        monkeypatch.setattr(client.requests, "post", rec)
+        op_search(PLAIN_PROFILE, "logs-*", sort="@timestamp:asc", hints=False)
+        assert rec.last_json is not None
+        assert rec.last_json["sort"] == [{"@timestamp": "asc"}]
+
+    def test_bare_sort_order_fails_before_any_request(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rec = RequestRecorder({})
+        monkeypatch.setattr(client.requests, "post", rec)
+        with pytest.raises(InvalidOptionError, match="<field>:<order>"):
+            op_search(PLAIN_PROFILE, "logs-*", sort="asc")
+        assert rec.last_url is None
+
+    def test_failed_shards_skip_the_zero_diagnosis(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        reason = "No mapping found for [asc] in order to sort on"
+        rec = RequestRecorder(
+            {
+                "hits": {"total": {"value": 0}, "hits": []},
+                "_shards": {
+                    "total": 93,
+                    "successful": 48,
+                    "skipped": 48,
+                    "failed": 45,
+                    "failures": [{"reason": {"reason": reason}}],
+                },
+            }
+        )
+        monkeypatch.setattr(client.requests, "post", rec)
+        monkeypatch.setattr(client, "check_request", lambda *a, **k: None)
+        op_search(PLAIN_PROFILE, "logs-*", extra_query='{"match_all":{}}')
+        # No follow-up _count: the request is broken, so a zero-diagnosis would mislead
+        assert rec.last_params == {"path": "logs-*/_search", "method": "POST"}
+        err = capsys.readouterr().err
+        assert reason in err
+        assert "filter is the problem" not in err
+
+
+class TestParseSort:
+    def test_default_sorts_the_time_field_newest_first(self) -> None:
+        assert client._parse_sort(None, "ts") == ("ts", "desc")
+
+    def test_field_and_order(self) -> None:
+        assert client._parse_sort("level.keyword:asc", "@timestamp") == ("level.keyword", "asc")
+
+    @pytest.mark.parametrize("value", ["asc", "desc", "@timestamp", "@timestamp:up", ":asc"])
+    def test_rejects_anything_but_field_and_order(self, value: str) -> None:
+        with pytest.raises(InvalidOptionError, match="<field>:<order>"):
+            client._parse_sort(value, "@timestamp")
+
 
 class TestOpCount:
     def test_returns_int(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -620,6 +675,25 @@ class TestFieldWarnings:
         aggs = [("code", "aggregation"), ("logger.keyword", "aggregation")]
         assert client._field_warnings(TYPES, refs, aggs) == []
 
+    def test_sort_on_text_field_suggests_keyword_sibling(self) -> None:
+        warning = client._field_warnings(TYPES, [], [("logger", "sort")])[0]
+        assert warning.startswith("sort on analyzed text field 'logger' has no doc values")
+        assert "logger.keyword" in warning
+
+    def test_unknown_sort_field(self) -> None:
+        warning = client._field_warnings(TYPES, [], [("timestamp", "sort")])[0]
+        assert warning.startswith("sort field 'timestamp' is not in the mapping")
+        assert "@timestamp" in warning
+
+
+class TestCheckRequest:
+    def test_sort_field_is_checked_against_the_mapping(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(client, "fetch_mapping", lambda *a, **k: {"logs-1": TYPES})
+        client.check_request(PLAIN_PROFILE, "logs-*", None, None, "timestamp", "@timestamp")
+        assert "sort field 'timestamp' is not in the mapping" in capsys.readouterr().err
+
 
 class TestSuggestFields:
     def test_suggests_a_misspelling(self) -> None:
@@ -695,6 +769,11 @@ class TestCheckEsErrorOn200:
     def test_shard_failure_warns_but_continues(self, capsys: pytest.CaptureFixture[str]) -> None:
         client._check_es_error({"_shards": {"total": 5, "failed": 2}}, {"_name": "prd"}, "svc")
         assert "2 of 5 shards failed" in capsys.readouterr().err
+
+    def test_shard_failure_names_the_reason(self, capsys: pytest.CaptureFixture[str]) -> None:
+        shards = {"total": 5, "failed": 2, "failures": [{"reason": {"reason": "boom"}}]}
+        client._check_es_error({"_shards": shards}, {"_name": "prd"}, "svc")
+        assert "2 of 5 shards failed, so the result is incomplete: boom" in capsys.readouterr().err
 
 
 class TestProfileScopedCaches:

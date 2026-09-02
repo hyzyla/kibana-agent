@@ -106,6 +106,10 @@ kibana-agent agent-help
    does not contain is left out. Without `-f` you get the whole document, truncated at
    `--max-source-len` characters (default 1000) — raise it when a long document gets cut.
 
+   `--sort <field>:<order>` changes the order — `--sort @timestamp:asc` gives the oldest documents
+   first. The order must be `asc` or `desc`, and both parts are required: a bare `--sort asc` is
+   an error, not a sort on the time field.
+
    Applications often log a whole JSON document into one string field. A traceback inside such a
    field arrives escaped several layers deep and is unreadable. `--expand-json` parses those
    strings back into objects and splits multi-line strings into a list of lines:
@@ -147,6 +151,7 @@ Warning: field 'http.response_status_int' is not in the mapping — this query c
          Did you mean: http.response_code?
 Warning: 'term' on analyzed text field 'level' matches nothing — use 'level.keyword'
 Warning: time field 'created_at' is not in the mapping — this index uses '@timestamp'
+Warning: sort field 'timestamp' is not in the mapping. Did you mean: @timestamp?
 Warning: index pattern 'ghost-*' matches no index, so every query returns 0.
 Note: 0 hits, but the last 1h holds 8,412 documents. The filter is the problem, not the window.
 Note: 0 hits, and the last 1h is empty. The pattern holds 91,234 documents overall — widen --last.
@@ -168,8 +173,10 @@ report it as "no matching documents". The CLI exits non-zero on an auth error, a
 unreachable host, so a zero that comes with a clean exit is a real zero — as long as no warning
 was printed.
 
-A partial result also prints a warning: `N of M shards failed`. The counts in that response are
-incomplete, so do not report them as totals.
+A partial result also prints a warning: `N of M shards failed, so the result is incomplete:
+<reason>`. Do not report its counts as totals. The reason names the broken part of the request —
+`No mapping found for [level] in order to sort on` means the sort field does not exist in that
+index. No zero-note follows such a warning, because the request failed, not the filter.
 
 ## Never Trust a `total` of 10000 Either
 

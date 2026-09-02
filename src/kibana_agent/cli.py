@@ -678,7 +678,7 @@ def count(
 @click.option("-q", "--query", "extra_query", default=None)
 @click.option("--kql", "kql_query", default=None, help="KQL filter")
 @click.option("-f", "--fields", "field_csv", default=None)
-@click.option("--sort", "sort_field", default=None)
+@click.option("--sort", "sort_field", default=None, help="<field>:<order>, e.g. @timestamp:asc")
 @click.option("--aggs", default=None)
 @click.option("--time-field", "time_field", default=DEFAULT_TIME_FIELD)
 @click.option("--max-source-len", "max_source_len", default=MAX_SOURCE_LEN, type=int)
@@ -1039,7 +1039,8 @@ All write operations are blocked. Safe to use in automated pipelines.
    - `-n <size>` — number of hits (default: 5)
    - `-q <json>` — extra ES query clause, e.g. '{"match":{"level":"ERROR"}}'
    - `-f <fields>` — comma-separated source fields to return
-   - `--sort <field>:<order>` — sort order (default: @timestamp:desc)
+   - `--sort <field>:<order>` — order is asc or desc (default: @timestamp:desc);
+     a bare `asc` is an error, not a sort on the time field
    - `--aggs <json>` — aggregation clause
    - `--expand-json` — parse JSON that the application logged into a string
      field, and split multi-line strings into lines. Use it with
@@ -1109,7 +1110,8 @@ Before the request:
     matching field names;
   - `term`/`terms` on an analyzed text field, naming the `.keyword` sibling
     when one exists;
-  - an aggregation on a text field, which has no doc values;
+  - an aggregation or `--sort` on a text field, which has no doc values;
+  - a `--sort` field that the mapping lacks;
   - `--time-field` missing from the mapping, naming the date field the index
     really uses;
   - an index pattern that matches no index at all.
@@ -1119,8 +1121,9 @@ After the request:
     not the window;
   - `0 hits, and the last <window> is empty` — widen `--last`;
   - `holds no documents at all` — wrong index pattern;
-  - `N of M shards failed` — the counts are partial, do not report them as
-    totals;
+  - `N of M shards failed ...: <reason>` — the result is incomplete, do not
+    report its counts. The reason names the broken part of the request, and
+    the zero-hint above is not printed, because the filter is not the cause;
   - documents cut at `--max-source-len`, which names the flag to raise.
 
 A zero with no note and a clean exit is a real zero.

@@ -73,6 +73,9 @@ def search_logs(
     ``{total, n, hits, ...}``. ``index_pattern`` defaults to the profile's
     configured default index.
 
+    ``sort`` takes ``<field>:<order>`` with order ``asc`` or ``desc``, for
+    example ``@timestamp:asc``; a bare order is an error.
+
     ``total`` is a floor when ``total_is_lower_bound`` is present: Elasticsearch
     stops counting at 10,000. Set ``expand_json`` to parse JSON that an
     application logged into a string field, and to split multi-line strings

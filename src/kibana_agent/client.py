@@ -65,6 +65,10 @@ class IndexResolutionError(KibanaAgentError):
     """Could not pick an index pattern from arguments and the active profile."""
 
 
+class InvalidOptionError(KibanaAgentError):
+    """An option has a value the request cannot use, caught before any call."""
+
+
 class DryRunResult(KibanaAgentError):
     """Raised by ``es`` when ``dry_run=True``; carries the rendered curl string."""
 
@@ -133,6 +137,7 @@ _AGGREGATABLE_TYPES = (
     )
 )
 _TIME_FIELD_PREFERENCE = ("@timestamp", "timestamp", "time", "event.created", "event.ingested")
+_SORT_ORDERS = ("asc", "desc")
 _EXPAND_JSON_DEPTH = 4
 _PREFIX_GROUP_MIN = 6
 _DATED_INDEX = re.compile(r"^(?P<stem>.+?)-(?:\d{4}[.\-]\d{2}|\d{4,})[.\-\d]*$")
@@ -708,7 +713,7 @@ def _check_es_error(data: Any, profile: dict[str, Any], username: str) -> None:
         raise KibanaApiError(int(status) if isinstance(status, int) else 200, message)
     shards = _failed_shards(data)
     if shards:
-        warn(f"{shards['failed']} of {shards.get('total', '?')} shards failed, results are partial")
+        warn(_shard_failure_message(shards))
 
 
 def _failed_shards(data: Any) -> dict[str, Any] | None:
@@ -717,6 +722,22 @@ def _failed_shards(data: Any) -> dict[str, Any] | None:
     if isinstance(shards, dict) and shards.get("failed"):
         return shards
     return None
+
+
+def _shard_failure_message(shards: dict[str, Any]) -> str:
+    """
+    Say how many shards failed and why. Without the reason, a broken request
+    such as a sort on a missing field looks like a partial answer.
+    """
+    message = (
+        f"{shards['failed']} of {shards.get('total', '?')} shards failed, "
+        f"so the result is incomplete"
+    )
+    for failure in shards.get("failures", []):
+        reason = failure.get("reason", {}).get("reason") if isinstance(failure, dict) else None
+        if reason:
+            return f"{message}: {reason}"
+    return message
 
 
 def _build_curl(
@@ -1328,6 +1349,7 @@ def check_request(
     index_pattern: str,
     query: dict[str, Any] | None,
     aggs: dict[str, Any] | None,
+    sort_field: str | None,
     time_field: str | None,
     *,
     no_cache: bool = False,
@@ -1362,6 +1384,8 @@ def check_request(
     _collect_query_fields(query, query_refs)
     _collect_agg_fields(aggs, agg_refs)
     value_refs = [(field, "aggregation") for field in agg_refs]
+    if sort_field:
+        value_refs.append((sort_field, "sort"))
     if bad_time_field:  # reported above, and it appears in every time filter
         query_refs = [ref for ref in query_refs if ref[0] != time_field]
         value_refs = [ref for ref in value_refs if ref[0] != time_field]
@@ -1484,6 +1508,23 @@ def _build_must(
     return must
 
 
+def _parse_sort(sort: str | None, time_field: str) -> tuple[str, str]:
+    """
+    Split a "<field>:<order>" sort into its parts. A bare order such as "asc"
+    would become a sort on a field named "asc", which Elasticsearch rejects
+    with "all shards failed" — an error that hides the real mistake.
+    """
+    if sort is None:
+        return time_field, "desc"
+    field, _, order = sort.rpartition(":")
+    if not field or order not in _SORT_ORDERS:
+        raise InvalidOptionError(
+            f"--sort must be <field>:<order> with order asc or desc, "
+            f"for example @timestamp:asc. Got '{sort}'."
+        )
+    return field, order
+
+
 def op_search(
     profile: dict[str, Any],
     index_pattern: str,
@@ -1502,21 +1543,23 @@ def op_search(
     **es_kwargs: Any,
 ) -> dict[str, Any]:
     """Search recent logs in an index pattern."""
+    sort_field, sort_order = _parse_sort(sort, time_field)
     body: dict[str, Any] = {
         "query": {"bool": {"must": _build_must(time_range, extra_query, kql, time_field)}},
         "size": size,
+        "sort": [{sort_field: sort_order}],
     }
-    sort_key, _, sort_order = (sort or f"{time_field}:desc").partition(":")
-    body["sort"] = [{sort_key: sort_order or "desc"}]
     if fields:
         body["_source"] = fields
     if aggs is not None:
         body["aggregations"] = aggs
     if hints:
-        check_request(profile, index_pattern, body["query"], aggs, time_field, **es_kwargs)
+        check_request(
+            profile, index_pattern, body["query"], aggs, sort_field, time_field, **es_kwargs
+        )
     data = es(profile, "POST", f"{index_pattern}/_search", body, **es_kwargs)
     result = _format_search_result(data, fields, max_source_len, expand_json)  # type: ignore[arg-type]
-    if hints and result["total"] == 0 and (extra_query or kql):
+    if hints and result["total"] == 0 and (extra_query or kql) and not _failed_shards(data):
         diagnose_zero(profile, index_pattern, time_range, time_field, **es_kwargs)
     return result
 
@@ -1535,10 +1578,10 @@ def op_count(
     """Count documents matching a query."""
     query = {"bool": {"must": _build_must(time_range, extra_query, kql, time_field)}}
     if hints:
-        check_request(profile, index_pattern, query, None, time_field, **es_kwargs)
+        check_request(profile, index_pattern, query, None, None, time_field, **es_kwargs)
     data = es(profile, "POST", f"{index_pattern}/_count", {"query": query}, **es_kwargs)
     total = int(data.get("count", 0))  # type: ignore[union-attr]
-    if hints and total == 0 and (extra_query or kql):
+    if hints and total == 0 and (extra_query or kql) and not _failed_shards(data):
         diagnose_zero(profile, index_pattern, time_range, time_field, **es_kwargs)
     return total
 
@@ -1571,7 +1614,13 @@ def op_histogram(
     }
     if hints:
         check_request(
-            profile, index_pattern, body["query"], body["aggregations"], time_field, **es_kwargs
+            profile,
+            index_pattern,
+            body["query"],
+            body["aggregations"],
+            None,
+            time_field,
+            **es_kwargs,
         )
     data = es(profile, "POST", f"{index_pattern}/_search", body, **es_kwargs)
     buckets = data.get("aggregations", {}).get("t", {}).get("buckets", [])  # type: ignore[union-attr]
