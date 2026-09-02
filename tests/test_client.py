@@ -612,11 +612,13 @@ class TestFieldWarnings:
         assert "match_phrase" in client._field_warnings(TYPES, [("msg", "term")], [])[0]
 
     def test_agg_on_text_field(self) -> None:
-        assert "no doc values" in client._field_warnings(TYPES, [], ["msg"])[0]
+        warning = client._field_warnings(TYPES, [], [("msg", "aggregation")])[0]
+        assert warning.startswith("aggregation on analyzed text field 'msg' has no doc values")
 
     def test_valid_query_and_agg_are_silent(self) -> None:
         refs = [("@timestamp", "range"), ("code", "term"), ("msg", "match")]
-        assert client._field_warnings(TYPES, refs, ["code", "logger.keyword"]) == []
+        aggs = [("code", "aggregation"), ("logger.keyword", "aggregation")]
+        assert client._field_warnings(TYPES, refs, aggs) == []
 
 
 class TestSuggestFields:

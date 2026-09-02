@@ -76,7 +76,6 @@ class DryRunResult(KibanaAgentError):
 DEFAULT_TIME_RANGE = "1h"
 DEFAULT_SIZE = 5
 DEFAULT_TIME_FIELD = "@timestamp"
-DEFAULT_SORT = f"{DEFAULT_TIME_FIELD}:desc"
 DEFAULT_TIMEOUT = 30
 MAX_SOURCE_LEN = 1000
 MAX_RESPONSE_HITS = 500
@@ -707,9 +706,17 @@ def _check_es_error(data: Any, profile: dict[str, Any], username: str) -> None:
         if status in (401, 403) or "security_exception" in str(error):
             message = f"{message}\n{_auth_hint(profile, username)}"
         raise KibanaApiError(int(status) if isinstance(status, int) else 200, message)
-    shards = data.get("_shards")
-    if isinstance(shards, dict) and shards.get("failed"):
+    shards = _failed_shards(data)
+    if shards:
         warn(f"{shards['failed']} of {shards.get('total', '?')} shards failed, results are partial")
+
+
+def _failed_shards(data: Any) -> dict[str, Any] | None:
+    """Return the "_shards" block of a response when at least one shard failed."""
+    shards = data.get("_shards") if isinstance(data, dict) else None
+    if isinstance(shards, dict) and shards.get("failed"):
+        return shards
+    return None
 
 
 def _build_curl(
@@ -1020,8 +1027,14 @@ def _suffix(items: list[str]) -> str:
 
 
 def _field_warnings(
-    types: dict[str, str], query_refs: list[tuple[str, str]], agg_refs: list[str]
+    types: dict[str, str], query_refs: list[tuple[str, str]], value_refs: list[tuple[str, str]]
 ) -> list[str]:
+    """
+    Warn about a field a request uses in a way its type does not support.
+    "query_refs" pairs a field with the query clause that reads it, and
+    "value_refs" pairs a field with the use that needs doc values, such as
+    "aggregation" or "sort".
+    """
     warnings: list[str] = []
     for field, clause in query_refs:
         field_type = types.get(field)
@@ -1036,18 +1049,18 @@ def _field_warnings(
             warnings.append(
                 f"'{clause}' on analyzed {field_type} field '{field}' matches nothing — {fix}"
             )
-    for field in agg_refs:
+    for field, use in value_refs:
         field_type = types.get(field)
         if field_type is None:
             warnings.append(
-                f"aggregation field '{field}' is not in the mapping."
+                f"{use} field '{field}' is not in the mapping."
                 f"{_suffix(_suggest_fields(types, field))}"
             )
         elif field_type in _ANALYZED_TYPES:
             hint = _keyword_sibling(types, field)
-            fix = f"use '{hint}'" if hint else "aggregate on a keyword, numeric, or date field"
+            fix = f"use '{hint}'" if hint else "use a keyword, numeric, or date field"
             warnings.append(
-                f"aggregation on analyzed {field_type} field '{field}' has no doc values — {fix}"
+                f"{use} on analyzed {field_type} field '{field}' has no doc values — {fix}"
             )
     return warnings
 
@@ -1348,11 +1361,23 @@ def check_request(
     agg_refs: list[str] = []
     _collect_query_fields(query, query_refs)
     _collect_agg_fields(aggs, agg_refs)
+    value_refs = [(field, "aggregation") for field in agg_refs]
     if bad_time_field:  # reported above, and it appears in every time filter
         query_refs = [ref for ref in query_refs if ref[0] != time_field]
-        agg_refs = [name for name in agg_refs if name != time_field]
-    for warning in _field_warnings(types, query_refs, agg_refs):
+        value_refs = [ref for ref in value_refs if ref[0] != time_field]
+    for warning in _field_warnings(types, query_refs, value_refs):
         warn(warning)
+
+
+def _count_or_none(
+    profile: dict[str, Any], index_pattern: str, query: dict[str, Any], **es_kwargs: Any
+) -> int | None:
+    """Count the documents a query matches; None when the count itself fails."""
+    try:
+        data = es(profile, "POST", f"{index_pattern}/_count", {"query": query}, **es_kwargs)
+    except (KibanaAgentError, requests.RequestException, ValueError):
+        return None
+    return int(data.get("count", 0)) if isinstance(data, dict) else None
 
 
 def diagnose_zero(
@@ -1366,15 +1391,9 @@ def diagnose_zero(
     Explain a zero result: say whether the filter, the window, or the index is
     empty. Runs only when a query returned nothing, so it costs nothing normally.
     """
-
-    def count(body: dict[str, Any]) -> int | None:
-        try:
-            data = es(profile, "POST", f"{index_pattern}/_count", body, **es_kwargs)
-        except (KibanaAgentError, requests.RequestException, ValueError):
-            return None
-        return int(data.get("count", 0)) if isinstance(data, dict) else None
-
-    in_window = count({"query": _time_range_filter(time_range, time_field)})
+    in_window = _count_or_none(
+        profile, index_pattern, _time_range_filter(time_range, time_field), **es_kwargs
+    )
     if in_window is None:
         return
     if in_window > 0:
@@ -1384,7 +1403,7 @@ def diagnose_zero(
         )
         return
 
-    total = count({"query": {"match_all": {}}})
+    total = _count_or_none(profile, index_pattern, {"match_all": {}}, **es_kwargs)
     if total:
         warn(
             f"0 hits, and the last {time_range} is empty. The pattern holds "
