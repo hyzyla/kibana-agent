@@ -106,9 +106,9 @@ kibana-agent agent-help
    does not contain is left out. Without `-f` you get the whole document, truncated at
    `--max-source-len` characters (default 1000) — raise it when a long document gets cut.
 
-   `--sort <field>:<order>` changes the order — `--sort @timestamp:asc` gives the oldest documents
-   first. The order must be `asc` or `desc`, and both parts are required: a bare `--sort asc` is
-   an error, not a sort on the time field.
+   `--sort <field>[:<order>]` changes the order — `--sort @timestamp:asc` gives the oldest
+   documents first. The order is `asc` or `desc` and defaults to `desc`. A bare `--sort asc` is an
+   error, not a sort on the time field; the error names the value to use instead.
 
    Applications often log a whole JSON document into one string field. A traceback inside such a
    field arrives escaped several layers deep and is unreadable. `--expand-json` parses those

@@ -421,7 +421,7 @@ class TestOpSearch:
     ) -> None:
         rec = RequestRecorder({})
         monkeypatch.setattr(client.requests, "post", rec)
-        with pytest.raises(InvalidOptionError, match="<field>:<order>"):
+        with pytest.raises(InvalidOptionError, match="Use --sort @timestamp:asc"):
             op_search(PLAIN_PROFILE, "logs-*", sort="asc")
         assert rec.last_url is None
 
@@ -530,10 +530,21 @@ class TestParseSort:
     def test_field_and_order(self) -> None:
         assert client._parse_sort("level.keyword:asc", "@timestamp") == ("level.keyword", "asc")
 
-    @pytest.mark.parametrize("value", ["asc", "desc", "@timestamp", "@timestamp:up", ":asc"])
-    def test_rejects_anything_but_field_and_order(self, value: str) -> None:
-        with pytest.raises(InvalidOptionError, match="<field>:<order>"):
-            client._parse_sort(value, "@timestamp")
+    def test_bare_field_sorts_newest_first(self) -> None:
+        assert client._parse_sort("level.keyword", "@timestamp") == ("level.keyword", "desc")
+
+    @pytest.mark.parametrize("order", ["asc", "desc"])
+    def test_bare_order_names_the_value_to_use(self, order: str) -> None:
+        with pytest.raises(InvalidOptionError, match=f"Use --sort ts:{order}"):
+            client._parse_sort(order, "ts")
+
+    def test_missing_field_names_the_value_to_use(self) -> None:
+        with pytest.raises(InvalidOptionError, match="Use --sort ts:asc"):
+            client._parse_sort(":asc", "ts")
+
+    def test_unknown_order_names_both_orders(self) -> None:
+        with pytest.raises(InvalidOptionError, match="Use --sort level:asc or --sort level:desc"):
+            client._parse_sort("level:up", "ts")
 
 
 class TestOpCount:

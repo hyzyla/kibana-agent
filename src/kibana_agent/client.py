@@ -1563,17 +1563,30 @@ def _build_must(
 
 def _parse_sort(sort: str | None, time_field: str) -> tuple[str, str]:
     """
-    Split a "<field>:<order>" sort into its parts. A bare order such as "asc"
-    would become a sort on a field named "asc", which Elasticsearch rejects
-    with "all shards failed" — an error that hides the real mistake.
+    Split a "<field>[:<order>]" sort into its parts; the order defaults to
+    "desc". A bare order such as "asc" would become a sort on a field named
+    "asc", which Elasticsearch rejects with "all shards failed" — an error
+    that hides the real mistake — so it fails here with the value to use.
     """
     if sort is None:
         return time_field, "desc"
-    field, _, order = sort.rpartition(":")
-    if not field or order not in _SORT_ORDERS:
+    if sort in _SORT_ORDERS:
         raise InvalidOptionError(
-            f"--sort must be <field>:<order> with order asc or desc, "
-            f"for example @timestamp:asc. Got '{sort}'."
+            f"--sort takes <field>:<order>, not a bare order. "
+            f"Use --sort {time_field}:{sort} to sort by the time field."
+        )
+    field, has_order, order = sort.rpartition(":")
+    if not has_order:
+        return sort, "desc"
+    if not field:
+        raise InvalidOptionError(
+            f"--sort takes <field>:<order>, and '{sort}' has no field. "
+            f"Use --sort {time_field}{sort} to sort by the time field."
+        )
+    if order not in _SORT_ORDERS:
+        raise InvalidOptionError(
+            f"--sort order must be asc or desc, not '{order}'. "
+            f"Use --sort {field}:asc or --sort {field}:desc."
         )
     return field, order
 
