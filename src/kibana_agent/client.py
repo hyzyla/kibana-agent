@@ -93,6 +93,14 @@ CACHE_TTL_ALIASES = 86400
 CACHE_TTL_MAPPING = 86400
 CACHE_TTL_CONTEXT = 86400
 
+# A Kibana with "server.restrictInternalApis" refuses the console proxy without
+# "x-elastic-internal-origin". An older Kibana ignores the header.
+PROXY_HEADERS = {
+    "kbn-xsrf": "true",
+    "x-elastic-internal-origin": "Kibana",
+    "Content-Type": "application/json",
+}
+
 try:
     CACHE_VERSION = importlib.metadata.version("kibana-agent")
 except importlib.metadata.PackageNotFoundError:  # source checkout, not installed
@@ -756,7 +764,7 @@ def _build_curl(
         "curl -s",
         '-u "$USER:$PASS"',
         f'-X POST "{full_url}"',
-        '-H "kbn-xsrf: true" -H "Content-Type: application/json"',
+        " ".join(f'-H "{name}: {value}"' for name, value in PROXY_HEADERS.items()),
         f"--max-time {timeout}",
     ]
     if body:
@@ -798,7 +806,7 @@ def es(
         response = requests.post(
             f"{url}{prefix}/api/console/proxy",
             params={"path": actual_path, "method": method},
-            headers={"kbn-xsrf": "true", "Content-Type": "application/json"},
+            headers=PROXY_HEADERS,
             json=body,
             auth=(username, password),
             timeout=timeout,

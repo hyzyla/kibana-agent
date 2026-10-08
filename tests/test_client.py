@@ -67,12 +67,14 @@ class RequestRecorder:
         self.last_params: dict[str, str] | None = None
         self.last_json: dict[str, Any] | None = None
         self.last_auth: tuple[str, str] | None = None
+        self.last_headers: dict[str, str] | None = None
 
     def __call__(self, url: str, **kwargs: Any) -> FakeResponse:
         self.last_url = url
         self.last_params = kwargs.get("params")
         self.last_json = kwargs.get("json")
         self.last_auth = kwargs.get("auth")
+        self.last_headers = kwargs.get("headers")
         return FakeResponse(self.payload, self.status)
 
 
@@ -322,6 +324,7 @@ class TestEs:
         assert "curl" in exc.value.curl
         # The path is URL-encoded inside the proxy URL, so check for the encoded form.
         assert "logs-%2A%2F_search" in exc.value.curl
+        assert '-H "x-elastic-internal-origin: Kibana"' in exc.value.curl
         assert called is False
 
     def test_4xx_raises_kibana_api_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -339,6 +342,11 @@ class TestEs:
         assert rec.last_url == "https://kibana.example.com/api/console/proxy"
         assert rec.last_params == {"path": "logs-*/_search", "method": "POST"}
         assert rec.last_json == {"q": 1}
+        assert rec.last_headers == {
+            "kbn-xsrf": "true",
+            "x-elastic-internal-origin": "Kibana",
+            "Content-Type": "application/json",
+        }
 
     def test_space_prefix_applied(self, monkeypatch: pytest.MonkeyPatch) -> None:
         rec = RequestRecorder({"hits": {"total": {"value": 0}, "hits": []}})
