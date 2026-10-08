@@ -1,6 +1,6 @@
 [project]
 name = "kibana-agent"
-version = "0.7.4"
+version = "0.7.5"
 description = "Read-only Kibana/Elasticsearch CLI optimised for AI agent usage"
 readme = "README.md"
 authors = [
