@@ -92,6 +92,7 @@ SHAPE_MIN_COMPRESSION = 2
 CACHE_TTL_ALIASES = 86400
 CACHE_TTL_MAPPING = 86400
 CACHE_TTL_CONTEXT = 86400
+CACHE_TTL_DATA_VIEWS = 3600
 
 # A Kibana with "server.restrictInternalApis" refuses the console proxy without
 # "x-elastic-internal-origin". An older Kibana ignores the header.
@@ -885,6 +886,140 @@ def _resolve_index(profile: dict[str, Any], index_pattern: str | None) -> str:
     if default_index:
         return default_index
     raise IndexResolutionError("No index pattern given and profile has no default index.")
+
+
+def kibana_get(
+    profile: dict[str, Any],
+    path: str,
+    *,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> dict[str, Any] | list[Any]:
+    """Read one Kibana API endpoint using the profile's authentication."""
+
+    if not path.startswith("/"):
+        path = f"/{path}"
+    url = profile["kibana_url"].rstrip("/")
+    prefix = _space_prefix(profile)
+    auth_config = profile["auth"]
+    headers = {"kbn-xsrf": "true"}
+    request_auth: tuple[str, str] | None
+    if auth_config.get("type") == "api-key":
+        api_key = auth_config.get("api_key")
+        if not api_key:
+            raise AuthError("API key auth selected but no API key was provided")
+        headers["Authorization"] = f"ApiKey {api_key}"
+        request_auth = None
+        auth_identity = "API key"
+    else:
+        username, password = creds(profile)
+        request_auth = (username, password)
+        auth_identity = username
+    try:
+        response = requests.get(
+            f"{url}{prefix}{path}",
+            headers=headers,
+            auth=request_auth,
+            timeout=timeout,
+        )
+    except requests.Timeout as exc:
+        raise KibanaAgentError(
+            f"Timeout after {timeout}s reaching {url}. Check the network or VPN, then retry."
+        ) from exc
+    except requests.ConnectionError as exc:
+        raise KibanaAgentError(
+            f"Cannot reach {url}: {str(exc)[:200]}\n"
+            f"Check the network or VPN, then retry. This is not an empty result."
+        ) from exc
+    if response.status_code >= 400:
+        detail = response.text
+        if response.status_code in (401, 403):
+            detail = f"{detail[:300]}\n{_auth_hint(profile, auth_identity)}"
+        raise KibanaApiError(response.status_code, detail)
+    return response.json()  # type: ignore[no-any-return]
+
+
+def fetch_data_views(
+    profile: dict[str, Any],
+    *,
+    no_cache: bool = False,
+) -> list[dict[str, Any]]:
+    """Return Kibana Data Views visible in the active space."""
+
+    if not no_cache:
+        cached = cache_get(profile, "data-views", CACHE_TTL_DATA_VIEWS)
+        if isinstance(cached, list):
+            return cached
+    payload = kibana_get(profile, "/api/data_views")
+    views: Any
+    if isinstance(payload, dict):
+        views = payload.get("data_view", payload.get("data_views", []))
+    else:
+        views = []
+    if not isinstance(views, list):
+        views = []
+    result = [view for view in views if isinstance(view, dict)]
+    cache_put(profile, "data-views", result)
+    return result
+
+
+def op_data_views(
+    profile: dict[str, Any],
+    *,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    """List non-secret Data View metadata for the active Kibana space."""
+
+    views = fetch_data_views(profile, no_cache=refresh)
+    compact = []
+    for view in views:
+        compact.append(
+            _strip_empty(
+                {
+                    "id": view.get("id"),
+                    "name": view.get("name"),
+                    "title": view.get("title"),
+                    "timeFieldName": view.get("timeFieldName"),
+                }
+            )
+        )
+    return {"data_views": compact}
+
+
+def resolve_index_target(
+    profile: dict[str, Any],
+    index_pattern: str | None,
+) -> str:
+    """Resolve a Kibana Data View name/id to its Elasticsearch title pattern.
+
+    Raw Elasticsearch wildcard patterns keep their existing behaviour. For
+    exact names, a matching Data View name or id wins; if Data View discovery
+    is unavailable or there is no match, the original target is preserved.
+    """
+
+    target = _resolve_index(profile, index_pattern)
+    if any(char in target for char in "*?["):
+        return target
+    try:
+        views = fetch_data_views(profile)
+    except KibanaApiError as exc:
+        if exc.status in (401, 403, 404):
+            return target
+        raise
+    matches = [
+        view
+        for view in views
+        if target in (str(view.get("id") or ""), str(view.get("name") or ""))
+    ]
+    if not matches:
+        return target
+    titles = {str(view.get("title") or "") for view in matches if view.get("title")}
+    if len(titles) == 1:
+        return next(iter(titles))
+    if len(titles) > 1:
+        raise IndexResolutionError(
+            f"Data View '{target}' is ambiguous; matching index patterns: {sorted(titles)}"
+        )
+    return target
 
 
 def _pluck(source: dict[str, Any], path: str) -> Any:

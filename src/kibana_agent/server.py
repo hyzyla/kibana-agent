@@ -83,7 +83,7 @@ def search_logs(
     such as tracebacks into a list of lines.
     """
     prof = _resolve(profile)
-    idx = client._resolve_index(prof, index_pattern)
+    idx = client.resolve_index_target(prof, index_pattern)
     return client.op_search(
         prof,
         idx,
@@ -111,7 +111,7 @@ def count_documents(
 ) -> dict[str, Any]:
     """Count documents matching a query in an index pattern over a time range."""
     prof = _resolve(profile)
-    idx = client._resolve_index(prof, index_pattern)
+    idx = client.resolve_index_target(prof, index_pattern)
     n = client.op_count(
         prof, idx, time_range=last, extra_query=query, kql=kql, time_field=time_field
     )
@@ -131,7 +131,7 @@ def get_histogram(
 ) -> dict[str, Any]:
     """Date histogram of doc counts. Useful for spotting trends and spikes."""
     prof = _resolve(profile)
-    idx = client._resolve_index(prof, index_pattern)
+    idx = client.resolve_index_target(prof, index_pattern)
     return client.op_histogram(
         prof,
         idx,
@@ -169,7 +169,7 @@ def get_mapping(
     common prefix). Pass ``full=True`` for the raw Elasticsearch mapping.
     """
     prof = _resolve(profile)
-    idx = client._resolve_index(prof, index_pattern)
+    idx = client.resolve_index_target(prof, index_pattern)
     return client.op_mapping(prof, idx, full=full)
 
 
@@ -182,7 +182,7 @@ def list_fields(
 ) -> dict[str, str]:
     """List field names matching a glob (e.g. ``*.host`` or ``log.*``)."""
     prof = _resolve(profile)
-    idx = client._resolve_index(prof, index_pattern)
+    idx = client.resolve_index_target(prof, index_pattern)
     return client.op_fields(prof, idx, glob=glob)
 
 
@@ -192,6 +192,21 @@ def list_aliases(profile: str | None = None) -> dict[str, list[str]]:
     """List all index aliases configured in the Kibana cluster."""
     prof = _resolve(profile)
     return client.op_aliases(prof)
+
+
+@mcp.tool()
+@safe
+def list_data_views(
+    refresh: bool = False,
+    profile: str | None = None,
+) -> dict[str, Any]:
+    """List Kibana Data Views visible in the active space.
+
+    Use the returned name or id as index_pattern in the other tools;
+    kibana-agent resolves it to the Data View's Elasticsearch title.
+    """
+    prof = _resolve(profile)
+    return client.op_data_views(prof, refresh=refresh)
 
 
 @mcp.tool()
@@ -215,7 +230,7 @@ def tail_logs(
     newer documents. Returns ``{hits, next_cursor}``.
     """
     prof = _resolve(profile)
-    idx = client._resolve_index(prof, index_pattern)
+    idx = client.resolve_index_target(prof, index_pattern)
     return client.op_tail_page(
         prof,
         idx,
@@ -260,7 +275,7 @@ def get_discover_url(
 ) -> dict[str, str]:
     """Build a Kibana Discover deep link with a pre-filled query and time range."""
     prof = _resolve(profile)
-    idx = client._resolve_index(prof, index_pattern)
+    idx = client.resolve_index_target(prof, index_pattern)
     return client.op_discover_url(prof, idx, time_range=last, kql=kql, lucene=lucene, fields=fields)
 
 

@@ -407,6 +407,98 @@ class TestEs:
         assert rec.last_url == "https://kibana.example.com/s/backend/api/console/proxy"
 
 
+class TestKibanaDataViews:
+    def test_kibana_get_applies_space_and_api_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rec = RequestRecorder({"data_view": []})
+        monkeypatch.setattr(client.requests, "get", rec)
+        profile = {
+            "kibana_url": "https://kibana.example.com",
+            "space": "backend",
+            "auth": {"type": "api-key", "api_key": "secret-api-key"},
+        }
+
+        assert client.kibana_get(profile, "/api/data_views") == {"data_view": []}
+        assert rec.last_url == "https://kibana.example.com/s/backend/api/data_views"
+        assert rec.last_auth is None
+        assert rec.last_headers == {
+            "kbn-xsrf": "true",
+            "Authorization": "ApiKey secret-api-key",
+        }
+
+    def test_resolve_index_target_by_data_view_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            client,
+            "fetch_data_views",
+            lambda _profile: [
+                {
+                    "id": "01234567-89ab-cdef-0123-456789abcdef",
+                    "name": "logs_performance_dsp",
+                    "title": "logs-performance-dsp-srvc-performance-dsp",
+                }
+            ],
+        )
+        assert (
+            client.resolve_index_target(PLAIN_PROFILE, "logs_performance_dsp")
+            == "logs-performance-dsp-srvc-performance-dsp"
+        )
+
+    def test_resolve_index_target_by_data_view_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            client,
+            "fetch_data_views",
+            lambda _profile: [
+                {"id": "view-1", "name": "Friendly name", "title": "logs-friendly-*"}
+            ],
+        )
+        assert client.resolve_index_target(PLAIN_PROFILE, "view-1") == "logs-friendly-*"
+
+    def test_resolve_index_target_preserves_raw_wildcard(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def fail(_profile: dict[str, Any]) -> list[dict[str, Any]]:
+            raise AssertionError("wildcards must not trigger Data View discovery")
+
+        monkeypatch.setattr(client, "fetch_data_views", fail)
+        assert client.resolve_index_target(PLAIN_PROFILE, "logs-*") == "logs-*"
+
+    def test_resolve_index_target_preserves_unknown_exact_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(client, "fetch_data_views", lambda _profile: [])
+        assert client.resolve_index_target(PLAIN_PROFILE, "logs-exact") == "logs-exact"
+
+    def test_list_data_views_is_compact(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            client,
+            "fetch_data_views",
+            lambda _profile, no_cache=False: [
+                {
+                    "id": "view-1",
+                    "name": "logs_performance_dsp",
+                    "title": "logs-performance-dsp-*",
+                    "timeFieldName": "@timestamp",
+                    "fields": {"huge": "payload"},
+                }
+            ],
+        )
+        assert client.op_data_views(PLAIN_PROFILE) == {
+            "data_views": [
+                {
+                    "id": "view-1",
+                    "name": "logs_performance_dsp",
+                    "title": "logs-performance-dsp-*",
+                    "timeFieldName": "@timestamp",
+                }
+            ]
+        }
+
+
 class TestOpSearch:
     def test_builds_query_with_kql_and_time_range(self, monkeypatch: pytest.MonkeyPatch) -> None:
         rec = RequestRecorder(
