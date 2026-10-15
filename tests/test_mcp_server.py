@@ -30,6 +30,14 @@ def _keep_existing_raw_index_semantics(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+def test_search_logs_recommends_server_side_aggregation() -> None:
+    description = server.search_logs.__doc__ or ""
+    assert "raw_es_query" in description
+    assert "runtime_mappings" in description
+    assert "terms" in description
+    assert "_truncated" in description
+
+
 def test_search_logs_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(client, "resolve_profile", lambda name=None: FAKE_PROFILE)
 

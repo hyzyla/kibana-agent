@@ -81,6 +81,14 @@ def search_logs(
     stops counting at 10,000. Set ``expand_json`` to parse JSON that an
     application logged into a string field, and to split multi-line strings
     such as tracebacks into a list of lines.
+
+    For distinct values, counts or distributions in large text logs, prefer
+    ``raw_es_query`` with a read-only ``POST <index>/_search`` request, a
+    ``size: 0`` body, ``runtime_mappings`` to extract values from log strings,
+    and a ``terms`` aggregation. Elasticsearch returns compact result buckets
+    without transferring individual documents. Do not download many
+    ``search_logs`` hits to analyze them locally: large log records may be
+    returned as ``_truncated`` due to the per-document length limit.
     """
     prof = _resolve(profile)
     idx = client.resolve_index_target(prof, index_pattern)
