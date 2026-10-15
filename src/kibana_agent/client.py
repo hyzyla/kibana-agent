@@ -611,12 +611,15 @@ def _profile_from_env() -> dict[str, Any] | None:
     if index := os.environ.get("KIBANA_INDEX"):
         profile["index"] = index
 
+    api_key = os.environ.get("KIBANA_API_KEY")
     op_user = os.environ.get("KIBANA_USERNAME_OP_REF")
     op_pass = os.environ.get("KIBANA_PASSWORD_OP_REF")
     plain_user = os.environ.get("KIBANA_USERNAME")
     plain_pass = os.environ.get("KIBANA_PASSWORD")
 
-    if op_user and op_pass:
+    if api_key:
+        profile["auth"] = {"type": "api-key", "api_key": api_key}
+    elif op_user and op_pass:
         profile["auth"] = {
             "type": "1password",
             "username_ref": op_user,
@@ -630,8 +633,8 @@ def _profile_from_env() -> dict[str, Any] | None:
         }
     else:
         raise ProfileNotFoundError(
-            "KIBANA_URL is set but credentials are missing. Set either "
-            "KIBANA_USERNAME + KIBANA_PASSWORD or "
+            "KIBANA_URL is set but credentials are missing. Set KIBANA_API_KEY, "
+            "KIBANA_USERNAME + KIBANA_PASSWORD, or "
             "KIBANA_USERNAME_OP_REF + KIBANA_PASSWORD_OP_REF."
         )
     return profile
@@ -755,14 +758,20 @@ def _build_curl(
     body: dict[str, Any] | None,
     timeout: int,
     filter_path: str | None,
+    auth_type: str,
 ) -> str:
     actual_path = path + (
         ("&" if "?" in path else "?") + f"filter_path={filter_path}" if filter_path else ""
     )
     full_url = f"{url}/api/console/proxy?{urlencode({'path': actual_path, 'method': method})}"
+    auth_part = (
+        '-H "Authorization: ApiKey $KIBANA_API_KEY"'
+        if auth_type == "api-key"
+        else '-u "$USER:$PASS"'
+    )
     parts = [
         "curl -s",
-        '-u "$USER:$PASS"',
+        auth_part,
         f'-X POST "{full_url}"',
         " ".join(f'-H "{name}: {value}"' for name, value in PROXY_HEADERS.items()),
         f"--max-time {timeout}",
@@ -796,9 +805,32 @@ def es(
     url = profile["kibana_url"].rstrip("/")
     prefix = _space_prefix(profile)
     if dry_run:
-        raise DryRunResult(_build_curl(url + prefix, method, path, body, timeout, filter_path))
+        raise DryRunResult(
+            _build_curl(
+                url + prefix,
+                method,
+                path,
+                body,
+                timeout,
+                filter_path,
+                str(profile.get("auth", {}).get("type", "")),
+            )
+        )
 
-    username, password = creds(profile)
+    auth_config = profile["auth"]
+    request_headers = dict(PROXY_HEADERS)
+    request_auth: tuple[str, str] | None
+    if auth_config.get("type") == "api-key":
+        api_key = auth_config.get("api_key")
+        if not api_key:
+            raise AuthError("API key auth selected but no API key was provided")
+        request_headers["Authorization"] = f"ApiKey {api_key}"
+        request_auth = None
+        auth_identity = "API key"
+    else:
+        username, password = creds(profile)
+        request_auth = (username, password)
+        auth_identity = username
     actual_path = path + (
         ("&" if "?" in path else "?") + f"filter_path={filter_path}" if filter_path else ""
     )
@@ -806,9 +838,9 @@ def es(
         response = requests.post(
             f"{url}{prefix}/api/console/proxy",
             params={"path": actual_path, "method": method},
-            headers=PROXY_HEADERS,
+            headers=request_headers,
             json=body,
-            auth=(username, password),
+            auth=request_auth,
             timeout=timeout,
         )
     except requests.Timeout as exc:
@@ -824,12 +856,12 @@ def es(
     if response.status_code >= 400:
         detail = response.text
         if response.status_code in (401, 403):
-            detail = f"{detail[:300]}\n{_auth_hint(profile, username)}"
+            detail = f"{detail[:300]}\n{_auth_hint(profile, auth_identity)}"
         raise KibanaApiError(response.status_code, detail)
     if len(response.content) > MAX_RESPONSE_BYTES:
         warn(f"{len(response.content):,}B response")
     data = response.json()
-    _check_es_error(data, profile, username)
+    _check_es_error(data, profile, auth_identity)
     return data  # type: ignore[no-any-return]
 
 
