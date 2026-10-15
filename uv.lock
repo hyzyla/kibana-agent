@@ -458,7 +458,7 @@ wheels = [
 
 [[package]]
 name = "kibana-agent"
-version = "0.7.5"
+version = "0.7.7"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
@@ -479,7 +479,7 @@ dev = [
 requires-dist = [
     { name = "click", specifier = ">=8.1" },
     { name = "keyring", specifier = ">=25.0" },
-    { name = "mcp", specifier = ">=1.0" },
+    { name = "mcp", specifier = ">=1.0,<2" },
     { name = "requests", specifier = ">=2.31" },
 ]
 

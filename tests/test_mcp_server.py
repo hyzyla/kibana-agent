@@ -21,6 +21,23 @@ FAKE_PROFILE: dict[str, Any] = {
 }
 
 
+@pytest.fixture(autouse=True)
+def _keep_existing_raw_index_semantics(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        client,
+        "resolve_index_target",
+        lambda profile, index_pattern: client._resolve_index(profile, index_pattern),
+    )
+
+
+def test_search_logs_recommends_server_side_aggregation() -> None:
+    description = server.search_logs.__doc__ or ""
+    assert "raw_es_query" in description
+    assert "runtime_mappings" in description
+    assert "terms" in description
+    assert "_truncated" in description
+
+
 def test_search_logs_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(client, "resolve_profile", lambda name=None: FAKE_PROFILE)
 
@@ -86,6 +103,45 @@ def test_count_documents_wraps_int_in_dict(monkeypatch: pytest.MonkeyPatch) -> N
     assert result == {"count": 17, "index": "logs-*", "last": "30m"}
 
 
+def test_list_data_views_returns_visible_views(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(client, "resolve_profile", lambda name=None: FAKE_PROFILE)
+    monkeypatch.setattr(
+        client,
+        "op_data_views",
+        lambda _profile, refresh=False: {
+            "data_views": [
+                {
+                    "id": "view-1",
+                    "name": "logs_performance_dsp",
+                    "title": "logs-performance-dsp-*",
+                }
+            ]
+        },
+    )
+    result = server.list_data_views()
+    assert result["data_views"][0]["name"] == "logs_performance_dsp"
+
+
+def test_search_logs_uses_resolved_data_view_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(client, "resolve_profile", lambda name=None: FAKE_PROFILE)
+    monkeypatch.setattr(
+        client,
+        "resolve_index_target",
+        lambda _profile, _index_pattern: "logs-performance-dsp-*",
+    )
+    captured: dict[str, Any] = {}
+
+    def fake_op_search(profile: dict[str, Any], idx: str, **_: Any) -> dict[str, Any]:
+        captured["idx"] = idx
+        return {"total": 0, "n": 0, "hits": []}
+
+    monkeypatch.setattr(client, "op_search", fake_op_search)
+    server.search_logs(index_pattern="logs_performance_dsp")
+    assert captured["idx"] == "logs-performance-dsp-*"
+
+
 def test_list_profiles_returns_dict(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         client,
@@ -120,6 +176,7 @@ def test_all_expected_tools_are_registered() -> None:
         "get_mapping",
         "list_fields",
         "list_aliases",
+        "list_data_views",
         "tail_logs",
         "raw_es_query",
         "get_discover_url",

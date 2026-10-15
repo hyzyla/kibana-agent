@@ -243,6 +243,19 @@ class TestResolveProfile:
         monkeypatch.setenv("KIBANA_AGENT_PROFILE", "prd")
         assert resolve_profile()["kibana_url"] == "https://prd.example"
 
+    def test_env_url_api_key_builds_ephemeral(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        self._isolate_config(monkeypatch, tmp_path, None)
+        monkeypatch.setenv("KIBANA_URL", "https://env.example/")
+        monkeypatch.setenv("KIBANA_API_KEY", "secret-api-key")
+        prof = resolve_profile()
+        assert prof["kibana_url"] == "https://env.example"
+        assert prof["auth"] == {
+            "type": "api-key",
+            "api_key": "secret-api-key",
+        }
+
     def test_env_url_plain_creds_builds_ephemeral(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
     ) -> None:
@@ -327,6 +340,16 @@ class TestEs:
         assert '-H "x-elastic-internal-origin: Kibana"' in exc.value.curl
         assert called is False
 
+    def test_api_key_dry_run_uses_env_placeholder(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        profile = {
+            "kibana_url": "https://kibana.example.com",
+            "auth": {"type": "api-key", "api_key": "secret-api-key"},
+        }
+        with pytest.raises(DryRunResult) as exc:
+            client.es(profile, "POST", "logs-*/_search", {"q": 1}, dry_run=True)
+        assert 'Authorization: ApiKey $KIBANA_API_KEY' in exc.value.curl
+        assert "secret-api-key" not in exc.value.curl
+
     def test_4xx_raises_kibana_api_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         rec = RequestRecorder({"error": "boom"}, status=401)
         monkeypatch.setattr(client.requests, "post", rec)
@@ -348,12 +371,132 @@ class TestEs:
             "Content-Type": "application/json",
         }
 
+    def test_api_key_401_uses_safe_auth_hint(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        rec = RequestRecorder({"error": "unauthorized"}, status=401)
+        monkeypatch.setattr(client.requests, "post", rec)
+        profile = {
+            "kibana_url": "https://kibana.example.com",
+            "auth": {"type": "api-key", "api_key": "secret-api-key"},
+        }
+        with pytest.raises(KibanaApiError) as exc:
+            client.es(profile, "GET", "_cat/indices")
+        assert "API key" in str(exc.value)
+        assert "secret-api-key" not in str(exc.value)
+
+    def test_passes_api_key_auth_header(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        rec = RequestRecorder({"hits": {"total": {"value": 0}, "hits": []}})
+        monkeypatch.setattr(client.requests, "post", rec)
+        profile = {
+            "kibana_url": "https://kibana.example.com",
+            "auth": {"type": "api-key", "api_key": "secret-api-key"},
+        }
+        client.es(profile, "POST", "logs-*/_search", {"q": 1})
+        assert rec.last_auth is None
+        assert rec.last_headers == {
+            "kbn-xsrf": "true",
+            "x-elastic-internal-origin": "Kibana",
+            "Content-Type": "application/json",
+            "Authorization": "ApiKey secret-api-key",
+        }
+
     def test_space_prefix_applied(self, monkeypatch: pytest.MonkeyPatch) -> None:
         rec = RequestRecorder({"hits": {"total": {"value": 0}, "hits": []}})
         monkeypatch.setattr(client.requests, "post", rec)
         prof = {**PLAIN_PROFILE, "space": "backend"}
         client.es(prof, "POST", "logs-*/_search", {})
         assert rec.last_url == "https://kibana.example.com/s/backend/api/console/proxy"
+
+
+class TestKibanaDataViews:
+    def test_kibana_get_applies_space_and_api_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rec = RequestRecorder({"data_view": []})
+        monkeypatch.setattr(client.requests, "get", rec)
+        profile = {
+            "kibana_url": "https://kibana.example.com",
+            "space": "backend",
+            "auth": {"type": "api-key", "api_key": "secret-api-key"},
+        }
+
+        assert client.kibana_get(profile, "/api/data_views") == {"data_view": []}
+        assert rec.last_url == "https://kibana.example.com/s/backend/api/data_views"
+        assert rec.last_auth is None
+        assert rec.last_headers == {
+            "kbn-xsrf": "true",
+            "Authorization": "ApiKey secret-api-key",
+        }
+
+    def test_resolve_index_target_by_data_view_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            client,
+            "fetch_data_views",
+            lambda _profile: [
+                {
+                    "id": "01234567-89ab-cdef-0123-456789abcdef",
+                    "name": "logs_performance_dsp",
+                    "title": "logs-performance-dsp-srvc-performance-dsp",
+                }
+            ],
+        )
+        assert (
+            client.resolve_index_target(PLAIN_PROFILE, "logs_performance_dsp")
+            == "logs-performance-dsp-srvc-performance-dsp"
+        )
+
+    def test_resolve_index_target_by_data_view_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            client,
+            "fetch_data_views",
+            lambda _profile: [
+                {"id": "view-1", "name": "Friendly name", "title": "logs-friendly-*"}
+            ],
+        )
+        assert client.resolve_index_target(PLAIN_PROFILE, "view-1") == "logs-friendly-*"
+
+    def test_resolve_index_target_preserves_raw_wildcard(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def fail(_profile: dict[str, Any]) -> list[dict[str, Any]]:
+            raise AssertionError("wildcards must not trigger Data View discovery")
+
+        monkeypatch.setattr(client, "fetch_data_views", fail)
+        assert client.resolve_index_target(PLAIN_PROFILE, "logs-*") == "logs-*"
+
+    def test_resolve_index_target_preserves_unknown_exact_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(client, "fetch_data_views", lambda _profile: [])
+        assert client.resolve_index_target(PLAIN_PROFILE, "logs-exact") == "logs-exact"
+
+    def test_list_data_views_is_compact(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            client,
+            "fetch_data_views",
+            lambda _profile, no_cache=False: [
+                {
+                    "id": "view-1",
+                    "name": "logs_performance_dsp",
+                    "title": "logs-performance-dsp-*",
+                    "timeFieldName": "@timestamp",
+                    "fields": {"huge": "payload"},
+                }
+            ],
+        )
+        assert client.op_data_views(PLAIN_PROFILE) == {
+            "data_views": [
+                {
+                    "id": "view-1",
+                    "name": "logs_performance_dsp",
+                    "title": "logs-performance-dsp-*",
+                    "timeFieldName": "@timestamp",
+                }
+            ]
+        }
 
 
 class TestOpSearch:
