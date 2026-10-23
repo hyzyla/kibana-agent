@@ -21,12 +21,12 @@ import functools
 from collections.abc import Callable
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from kibana_agent import client
 from kibana_agent.client import KibanaAgentError
 
-mcp = FastMCP("kibana-agent")
+mcp = MCPServer("kibana-agent")
 
 
 def safe(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -293,7 +293,7 @@ def remember_fact(facts: dict[str, str], profile: str | None = None) -> dict[str
 
 
 def run() -> None:
-    """Run the FastMCP server over stdio (the default transport)."""
+    """Run the MCP server over stdio (the default transport)."""
     mcp.run()
 
 

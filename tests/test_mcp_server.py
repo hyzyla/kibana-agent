@@ -1,6 +1,6 @@
 """Smoke tests for the MCP server wrappers in :mod:`kibana_agent.server`.
 
-FastMCP's ``@mcp.tool()`` decorator returns the original function unchanged,
+MCPServer's ``@mcp.tool()`` decorator returns the original function unchanged,
 so we can call the registered tool functions directly without going through
 the JSON-RPC envelope.
 """

@@ -21,7 +21,7 @@ dependencies = [
     "certifi>=2026.10.19",  # removes the compromised eMudhra root
     "click>=8.1",
     "keyring>=25.0",
-    "mcp>=1.0",
+    "mcp>=2.0,<3",
 ]
 
 [project.urls]
