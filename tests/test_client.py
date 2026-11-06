@@ -35,6 +35,19 @@ PLAIN_PROFILE: dict[str, Any] = {
     "auth": {"type": "plain", "username": "alice", "password": "s3cret"},
 }
 
+KEYCHAIN_PROFILE: dict[str, Any] = {
+    "_name": "prd",
+    "kibana_url": "https://kibana.example.com",
+    "auth": {
+        "type": "keychain",
+        "service": "kibana-prd",
+        "username_account": "user",
+        "password_account": "pass",
+    },
+}
+
+DEFAULT_CONTEXT: dict[str, Any] = {"indices": {"default-*": {"docs": 1}}}
+
 INDEX_NAMES = [
     "k8s-edo-000397",
     "k8s-kasa-2026.08.07",
@@ -55,6 +68,27 @@ class FakeResponse:
 
     def json(self) -> Any:
         return self._payload
+
+
+class FakeKeyring:
+    """An in-memory OS keyring, so tests never touch the real one."""
+
+    def __init__(self, entries: dict[tuple[str, str], str]) -> None:
+        self.entries = dict(entries)
+
+    def read(self, service: str, account: str) -> str | None:
+        return self.entries.get((service, account))
+
+    def write(self, service: str, account: str, value: str) -> None:
+        self.entries[(service, account)] = value
+
+    def delete(self, service: str, account: str) -> None:
+        self.entries.pop((service, account), None)
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(client, "keychain_read", self.read)
+        monkeypatch.setattr(client, "keychain_write", self.write)
+        monkeypatch.setattr(client, "keychain_delete", self.delete)
 
 
 class RequestRecorder:
@@ -845,6 +879,12 @@ class TestCheckEsErrorOn200:
         with pytest.raises(KibanaApiError) as excinfo:
             client._check_es_error(body, {"_name": "prd"}, "svc")
         assert "unable to authenticate user" in str(excinfo.value)
+        assert "reads them again" in str(excinfo.value)
+
+    def test_forbidden_error_names_the_cache_clear_command(self) -> None:
+        body = {"error": {"type": "security_exception", "reason": "no privileges"}, "status": 403}
+        with pytest.raises(KibanaApiError) as excinfo:
+            client._check_es_error(body, {"_name": "prd"}, "svc")
         assert "cache-clear --creds-only" in str(excinfo.value)
 
     def test_string_error_raises(self) -> None:
@@ -1145,3 +1185,103 @@ class TestTrimFields:
         fields = {f"a.b.c{i}": "keyword" for i in range(80)}
         out = client._trim_fields(fields, "logs-*")
         assert out["a.b.*"] == "80 fields"
+
+
+class TestCollectWarnings:
+    def test_collects_inside_and_writes_to_stderr_outside(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with client.collect_warnings() as warnings:
+            client.warn("inside")
+        client.warn("outside")
+        assert warnings == ["inside"]
+        assert capsys.readouterr().err == "Warning: outside\n"
+
+
+class TestOpContextCache:
+    @pytest.fixture(autouse=True)
+    def _offline(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        def no_mapping(*_a: Any, **_k: Any) -> dict[str, Any]:
+            raise client.KibanaAgentError("no mapping")
+
+        monkeypatch.setattr(client, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(client, "profile_notes", lambda profile: {"app": "app-*"})
+        monkeypatch.setattr(client, "es", lambda *a, **k: {})
+        monkeypatch.setattr(client, "fetch_mapping", no_mapping)
+        monkeypatch.setattr(client, "_pattern_stats", lambda *a: {"docs": 2})
+        monkeypatch.setattr(client, "_cluster_info", lambda *a: {})
+        client.cache_put({"_name": "prd"}, "context", DEFAULT_CONTEXT)
+
+    def test_default_call_reads_the_cache(self) -> None:
+        ctx = client.op_context({"_name": "prd"})
+        assert ctx["indices"] == {"default-*": {"docs": 1}}
+
+    def test_indices_skip_the_cache(self) -> None:
+        ctx = client.op_context({"_name": "prd"}, indices="app-*")
+        assert ctx["indices"] == {"app-*": {"docs": 2}}
+
+    def test_indices_keep_the_default_cache(self) -> None:
+        client.op_context({"_name": "prd"}, indices="app-*")
+        cached = client.cache_get({"_name": "prd"}, "context", client.CACHE_TTL_CONTEXT)
+        assert cached == DEFAULT_CONTEXT
+
+
+class TestCredsCache:
+    @pytest.fixture
+    def keyring_store(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> FakeKeyring:
+        monkeypatch.setattr(client, "CONFIG_FILE", tmp_path / "config.json")
+        monkeypatch.delenv("KIBANA_AGENT_CRED_CACHE_TTL", raising=False)
+        store = FakeKeyring({("kibana-prd", "user"): "alice", ("kibana-prd", "pass"): "old"})
+        store.install(monkeypatch)
+        return store
+
+    def test_keychain_creds_are_cached(self, keyring_store: FakeKeyring) -> None:
+        assert client.creds(KEYCHAIN_PROFILE) == ("alice", "old")
+        keyring_store.write("kibana-prd", "pass", "new")
+        assert client.creds(KEYCHAIN_PROFILE) == ("alice", "old")
+
+    def test_plain_creds_are_never_cached(self, keyring_store: FakeKeyring) -> None:
+        client.creds(PLAIN_PROFILE)
+        changed = {**PLAIN_PROFILE, "auth": {"type": "plain", "username": "bob", "password": "x"}}
+        assert client.creds(changed) == ("bob", "x")
+        assert client._creds_cache == {}
+
+    def test_401_drops_the_cached_creds(
+        self, keyring_store: FakeKeyring, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client.creds(KEYCHAIN_PROFILE)
+        keyring_store.write("kibana-prd", "pass", "new")
+        monkeypatch.setattr(client.requests, "post", RequestRecorder({"error": "x"}, status=401))
+        with pytest.raises(KibanaApiError) as excinfo:
+            client.es(KEYCHAIN_PROFILE, "POST", "logs-*/_search", {})
+        assert "reads them again" in str(excinfo.value)
+        assert client.creds(KEYCHAIN_PROFILE) == ("alice", "new")
+
+    def test_401_in_a_200_body_drops_the_cached_creds(self, keyring_store: FakeKeyring) -> None:
+        client.creds(KEYCHAIN_PROFILE)
+        keyring_store.write("kibana-prd", "pass", "new")
+        body = {"error": {"type": "security_exception", "reason": "bad creds"}, "status": 401}
+        with pytest.raises(KibanaApiError):
+            client._check_es_error(body, KEYCHAIN_PROFILE, "alice")
+        assert client.creds(KEYCHAIN_PROFILE) == ("alice", "new")
+
+    def test_403_keeps_the_cached_creds(
+        self, keyring_store: FakeKeyring, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client.creds(KEYCHAIN_PROFILE)
+        keyring_store.write("kibana-prd", "pass", "new")
+        monkeypatch.setattr(client.requests, "post", RequestRecorder({"error": "x"}, status=403))
+        with pytest.raises(KibanaApiError):
+            client.es(KEYCHAIN_PROFILE, "POST", "logs-*/_search", {})
+        assert client.creds(KEYCHAIN_PROFILE) == ("alice", "old")
+
+    def test_401_on_a_plain_profile_leaves_the_keyring_alone(
+        self, keyring_store: FakeKeyring, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def fail_delete(service: str, account: str) -> None:
+            raise AssertionError("a plain profile has nothing in the keyring")
+
+        monkeypatch.setattr(client, "keychain_delete", fail_delete)
+        monkeypatch.setattr(client.requests, "post", RequestRecorder({"error": "x"}, status=401))
+        with pytest.raises(KibanaApiError):
+            client.es(PLAIN_PROFILE, "POST", "logs-*/_search", {})

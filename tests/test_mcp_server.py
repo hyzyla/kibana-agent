@@ -7,6 +7,7 @@ the JSON-RPC envelope.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -108,6 +109,69 @@ def test_tail_logs_passes_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
     result = server.tail_logs(since_cursor=[42, "y"])
     assert result["next_cursor"] == [99, "z"]
     assert captured["since_cursor"] == [42, "y"]
+
+
+def test_warnings_come_back_in_the_result(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(client, "resolve_profile", lambda name=None: FAKE_PROFILE)
+
+    def fake_op_count(*_a: Any, **_k: Any) -> int:
+        client.warn("0 hits, but the last 1h holds 12 documents.")
+        return 0
+
+    monkeypatch.setattr(client, "op_count", fake_op_count)
+    result = server.count_documents(index_pattern="logs-*")
+    assert result == {
+        "count": 0,
+        "index": "logs-*",
+        "last": "1h",
+        "warnings": ["0 hits, but the last 1h holds 12 documents."],
+    }
+    assert capsys.readouterr().err == ""
+
+
+def test_warnings_come_back_with_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    def warn_then_fail(name: str | None = None) -> dict[str, Any]:
+        client.warn("first")
+        raise ProfileNotFoundError("no profile here")
+
+    monkeypatch.setattr(client, "resolve_profile", warn_then_fail)
+    result = server.search_logs(index_pattern="logs-*")
+    assert result == {
+        "error": "no profile here",
+        "type": "ProfileNotFoundError",
+        "warnings": ["first"],
+    }
+
+
+def test_list_aliases_with_warnings_passes_the_output_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(client, "resolve_profile", lambda name=None: FAKE_PROFILE)
+
+    def fake_op_aliases(profile: dict[str, Any]) -> dict[str, list[str]]:
+        client.warn("big response")
+        return {"logs": ["logs-000001"]}
+
+    monkeypatch.setattr(client, "op_aliases", fake_op_aliases)
+    result = asyncio.run(server.mcp.call_tool("list_aliases", {}))
+    assert result.structured_content == {
+        "aliases": {"logs": ["logs-000001"]},
+        "warnings": ["big response"],
+    }
+
+
+def test_list_aliases_error_passes_the_output_schema(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(name: str | None = None) -> dict[str, Any]:
+        raise ProfileNotFoundError("no profile here")
+
+    monkeypatch.setattr(client, "resolve_profile", boom)
+    result = asyncio.run(server.mcp.call_tool("list_aliases", {}))
+    assert result.structured_content == {
+        "error": "no profile here",
+        "type": "ProfileNotFoundError",
+    }
 
 
 def test_all_expected_tools_are_registered() -> None:

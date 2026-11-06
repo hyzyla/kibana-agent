@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
 from kibana_agent import cli as cli_module
+from kibana_agent import client
 from kibana_agent.cli import cli
 
 
@@ -49,3 +51,26 @@ class TestEmit:
         lines = capsys.readouterr().out.strip().split("\n")
         assert lines[0] == '#{"total":2,"n":2}'
         assert [json.loads(line) for line in lines[1:]] == [{"a": 1}, {"a": 2}]
+
+
+def test_profile_update_drops_the_cached_creds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(client, "CONFIG_FILE", tmp_path / "config.json")
+    monkeypatch.setattr(client, "CONFIG_DIR", tmp_path)
+    auth = {
+        "type": "keychain",
+        "service": "kibana-prd",
+        "username_account": "user",
+        "password_account": "pass",
+    }
+    client.save_config(
+        {"active": "prd", "profiles": {"prd": {"kibana_url": "https://k", "auth": auth}}}
+    )
+    deleted: list[str] = []
+    monkeypatch.setattr(client, "keychain_delete", lambda service, account: deleted.append(account))
+
+    result = CliRunner().invoke(cli, ["profile", "update", "prd", "--kc-password-account", "new"])
+
+    assert result.exit_code == 0, result.output
+    assert deleted == list(client._cred_cache_accounts({"_name": "prd"}))

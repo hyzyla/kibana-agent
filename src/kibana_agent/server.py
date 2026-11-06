@@ -30,19 +30,28 @@ mcp = MCPServer("kibana-agent")
 
 
 def safe(fn: Callable[..., Any]) -> Callable[..., Any]:
-    """Convert ``KibanaAgentError`` raised by a tool into a structured error.
+    """
+    Convert ``KibanaAgentError`` raised by a tool into a structured error, and
+    return the warnings of the call with the result.
 
     The wrapped tool always returns a dict; on success it's the underlying
     payload, on failure it's ``{"error": str, "type": str}`` so the LLM gets a
     clean, parseable failure rather than an opaque MCP transport error.
+    Warnings go into a "warnings" list, because an MCP client does not show
+    stderr to the model.
     """
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
-        try:
-            return fn(*args, **kwargs)
-        except KibanaAgentError as exc:
-            return {"error": str(exc), "type": type(exc).__name__}
+        with client.collect_warnings() as warnings:
+            try:
+                result = fn(*args, **kwargs)
+            except KibanaAgentError as exc:
+                result = {"error": str(exc), "type": type(exc).__name__}
+
+        if warnings:
+            result["warnings"] = warnings
+        return result
 
     return wrapper
 
@@ -150,9 +159,11 @@ def get_context(
     refresh: bool = False,
     profile: str | None = None,
 ) -> dict[str, Any]:
-    """Compact overview of available indices, aliases, field mappings, and
-    recent doc counts. Cached for an hour; pass ``refresh=True`` to bypass
-    the cache. Best first call when exploring a new Kibana instance.
+    """
+    Compact overview of available indices, aliases, field mappings, and
+    recent doc counts. Cached for 24 hours; pass ``refresh=True`` to bypass
+    the cache. A call with ``indices`` is never cached. Best first call when
+    exploring a new Kibana instance.
     """
     prof = _resolve(profile)
     return client.op_context(prof, indices=indices, refresh=refresh)
@@ -179,19 +190,25 @@ def list_fields(
     index_pattern: str | None = None,
     glob: str = "*",
     profile: str | None = None,
-) -> dict[str, str]:
-    """List field names matching a glob (e.g. ``*.host`` or ``log.*``)."""
+) -> dict[str, Any]:
+    """
+    List field names matching a glob (e.g. ``*.host`` or ``log.*``).
+    Returns ``{fields: {name: type}}``.
+    """
     prof = _resolve(profile)
     idx = client._resolve_index(prof, index_pattern)
-    return client.op_fields(prof, idx, glob=glob)
+    return {"fields": client.op_fields(prof, idx, glob=glob)}
 
 
 @mcp.tool()
 @safe
-def list_aliases(profile: str | None = None) -> dict[str, list[str]]:
-    """List all index aliases configured in the Kibana cluster."""
+def list_aliases(profile: str | None = None) -> dict[str, Any]:
+    """
+    List all index aliases configured in the Kibana cluster.
+    Returns ``{aliases: {index: [alias, ...]}}``.
+    """
     prof = _resolve(profile)
-    return client.op_aliases(prof)
+    return {"aliases": client.op_aliases(prof)}
 
 
 @mcp.tool()
@@ -257,7 +274,7 @@ def get_discover_url(
     lucene: str | None = None,
     fields: list[str] | None = None,
     profile: str | None = None,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Build a Kibana Discover deep link with a pre-filled query and time range."""
     prof = _resolve(profile)
     idx = client._resolve_index(prof, index_pattern)

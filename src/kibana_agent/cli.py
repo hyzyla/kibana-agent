@@ -454,6 +454,8 @@ def profile_update(
         click.echo(f"Profile '{name}' not found.", err=True)
         sys.exit(1)
 
+    old_profile = client.get_profile(name)
+
     if url:
         profile_data["kibana_url"] = url.rstrip("/")
 
@@ -514,6 +516,7 @@ def profile_update(
 
     config["profiles"][name] = profile_data
     client.save_config(config)
+    client.cached_creds_clear_profile(old_profile)
     click.echo(f"Updated profile '{name}'")
 
 
@@ -533,7 +536,7 @@ def context(
     fmt: str,
     no_cache: bool,
 ) -> None:
-    """Compact context summary: indices, fields, doc counts. Cached."""
+    """Compact context summary: indices, fields, doc counts. Cached, except with --indices."""
     prof = client.resolve_profile(prof_name)
     ctx = client.op_context(
         prof,
