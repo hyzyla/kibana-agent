@@ -284,8 +284,10 @@ Do not carry index patterns, field names, or timezone strings from one cluster t
 differ. Re-run `aliases`, `fields`, and `mapping` for each profile.
 
 Caches are keyed per profile, so `--profile X` never returns data or credentials belonging to
-profile Y. If credentials look stale, run `cache-clear --creds-only` and retry — that
-re-authenticates without discarding the cached mappings, which can be several MB per cluster.
+profile Y. A 401 and `profile update` drop the cached credentials, so the next call reads them
+again. If credentials still look stale (for example, a 403 names the wrong user), run
+`cache-clear --creds-only` and retry — that re-authenticates without discarding the cached
+mappings, which can be several MB per cluster.
 
 ## Other Commands
 

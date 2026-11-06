@@ -24,6 +24,8 @@ import re
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -111,6 +113,10 @@ _CRED_CACHE_TTL_DEFAULT = 24 * 3600  # 24 hours
 _CRED_CACHE_TTL_ENV = "KIBANA_AGENT_CRED_CACHE_TTL"
 _CRED_CACHE_TTL_CONFIG_KEY = "cred_cache_ttl"
 _CRED_CACHE_KEYS = ("cache-username", "cache-password", "cache-ts")
+# Plain credentials are in the config file already, so only these are cached.
+_CACHED_AUTH_TYPES = ("1password", "keychain")
+
+_collected_warnings: ContextVar[list[str] | None] = ContextVar("collected_warnings", default=None)
 
 _FIELD_CLAUSES = (
     "match",
@@ -416,6 +422,13 @@ def _cached_creds_put(profile: dict[str, Any], username: str, password: str) -> 
 
 
 def cached_creds_clear_profile(profile: dict[str, Any]) -> None:
+    """
+    Drop the cached credentials of one profile, so the next call reads them
+    again from 1Password or the OS keyring.
+    """
+    if profile.get("auth", {}).get("type") not in _CACHED_AUTH_TYPES:
+        return
+
     for account in _cred_cache_accounts(profile):
         keychain_delete(_CRED_CACHE_SERVICE, account)
     _creds_cache.pop(_profile_cache_key(profile), None)
@@ -499,31 +512,25 @@ _creds_cache: dict[str, tuple[str, str]] = {}
 
 
 def creds(profile: dict[str, Any]) -> tuple[str, str]:
-    key = _profile_cache_key(profile)
-    cached_in_mem = _creds_cache.get(key)
-    if cached_in_mem is not None:
-        return cached_in_mem
-
     auth = profile["auth"]
     auth_type = auth["type"]
-
-    if auth_type in ("1password", "keychain"):
-        cached = _cached_creds_get(profile)
-        if cached:
-            _creds_cache[key] = cached
-            return cached
-
     backend = _AUTH_BACKENDS.get(auth_type)
     if not backend:
         raise AuthError(f"Unknown auth type: {auth_type}")
 
-    username, password = backend(auth)
-    _creds_cache[key] = (username, password)
+    if auth_type not in _CACHED_AUTH_TYPES:
+        username, password = backend(auth)
+        return username, password
 
-    if auth_type in ("1password", "keychain"):
-        _cached_creds_put(profile, username, password)
+    key = _profile_cache_key(profile)
+    cached = _creds_cache.get(key) or _cached_creds_get(profile)
+    if cached is None:
+        username, password = backend(auth)
+        _cached_creds_put(profile, username=username, password=password)
+        cached = (username, password)
 
-    return username, password
+    _creds_cache[key] = cached
+    return cached
 
 
 def _profile_cache_dir(profile: dict[str, Any]) -> Path:
@@ -686,13 +693,39 @@ def _guard(method: str, path: str) -> None:
 def warn(message: str) -> None:
     """
     Report something the caller should notice but that does not stop the call.
-    Goes to stderr so it never mixes into the data on stdout.
+    Inside "collect_warnings" the message goes into the collected list.
+    Otherwise it goes to stderr, so it never mixes into the data on stdout.
     """
+    collected = _collected_warnings.get()
+    if collected is not None:
+        collected.append(message)
+        return
+
     sys.stderr.write(f"Warning: {message}\n")
 
 
-def _auth_hint(profile: dict[str, Any], username: str) -> str:
+@contextlib.contextmanager
+def collect_warnings() -> Iterator[list[str]]:
+    """
+    Collect the warnings of one call in a list instead of writing them to stderr.
+    The MCP server needs this: an MCP client does not show stderr to the model.
+    """
+    collected: list[str] = []
+    token = _collected_warnings.set(collected)
+    try:
+        yield collected
+    finally:
+        _collected_warnings.reset(token)
+
+
+def _auth_hint(profile: dict[str, Any], username: str, status: object) -> str:
     label = profile_label(profile)
+    if status == 401:
+        return (
+            f"Profile '{label}' sent user '{username}', and the cluster rejected the "
+            f"credentials. The next call reads them again from the credential store. "
+            f"If it fails again, fix them there."
+        )
     return (
         f"Profile '{label}' authenticated as '{username}'. If that is the wrong user, "
         f"the cached credentials are stale: "
@@ -715,9 +748,11 @@ def _check_es_error(data: Any, profile: dict[str, Any], username: str) -> None:
         detail = error.get("reason") or error.get("type")
     if detail is not None:
         status = data.get("status", 200)
+        if status == 401:
+            cached_creds_clear_profile(profile)
         message = str(detail)[:300]
         if status in (401, 403) or "security_exception" in str(error):
-            message = f"{message}\n{_auth_hint(profile, username)}"
+            message = f"{message}\n{_auth_hint(profile, username, status)}"
         raise KibanaApiError(int(status) if isinstance(status, int) else 200, message)
     shards = _failed_shards(data)
     if shards:
@@ -822,9 +857,11 @@ def es(
             f"Check the network or VPN, then retry. This is not an empty result."
         ) from exc
     if response.status_code >= 400:
+        if response.status_code == 401:
+            cached_creds_clear_profile(profile)
         detail = response.text
         if response.status_code in (401, 403):
-            detail = f"{detail[:300]}\n{_auth_hint(profile, username)}"
+            detail = f"{detail[:300]}\n{_auth_hint(profile, username, response.status_code)}"
         raise KibanaApiError(response.status_code, detail)
     if len(response.content) > MAX_RESPONSE_BYTES:
         warn(f"{len(response.content):,}B response")
@@ -1721,10 +1758,12 @@ def op_context(
     no_cache: bool = False,
     **es_kwargs: Any,
 ) -> dict[str, Any]:
-    """Compact context summary: aliases, prefixes, mappings, recent doc counts.
+    """
+    Compact context summary: aliases, prefixes, mappings, recent doc counts.
 
     Cached for ``CACHE_TTL_CONTEXT`` seconds. Pass ``refresh=True`` to force a
-    fresh fetch.
+    fresh fetch. The cache holds only the default patterns, so a call with
+    ``indices`` neither reads nor writes it.
     """
     notes = profile_notes(profile)
     if not notes:
@@ -1733,7 +1772,7 @@ def op_context(
             f"which application, or which field carries a value, record it:\n"
             f"  kibana-agent profile note {profile_label(profile)} <key>=<value>"
         )
-    if not refresh and not no_cache:
+    if not refresh and not no_cache and not indices:
         cached = cache_get(profile, "context", CACHE_TTL_CONTEXT)
         if cached is not None:
             return _with_notes(cached, notes)
@@ -1771,7 +1810,8 @@ def op_context(
         "indices": stats,
         "mappings": mappings,
     }
-    cache_put(profile, "context", ctx)
+    if not indices:
+        cache_put(profile, "context", ctx)
     return _with_notes(ctx, notes)
 
 
