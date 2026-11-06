@@ -104,9 +104,10 @@ PROXY_HEADERS = {
 }
 
 try:
-    CACHE_VERSION = importlib.metadata.version("kibana-agent")
+    PACKAGE_VERSION = importlib.metadata.version("kibana-agent")
 except importlib.metadata.PackageNotFoundError:  # source checkout, not installed
-    CACHE_VERSION = "dev"
+    PACKAGE_VERSION = "dev"
+CACHE_VERSION = PACKAGE_VERSION
 
 _CRED_CACHE_SERVICE = "kibana-agent"
 _CRED_CACHE_TTL_DEFAULT = 24 * 3600  # 24 hours
