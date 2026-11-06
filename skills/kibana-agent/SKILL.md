@@ -306,6 +306,26 @@ mappings, which can be several MB per cluster.
   (default 24h). `0` disables; `unset` removes the override. Env override:
   `KIBANA_AGENT_CRED_CACHE_TTL`.
 
+## Something Broken? Offer to Send Feedback
+
+When a command fails, a hint is wrong, or a result looks wrong, offer the user to report it to the
+kibana-agent developer. Never send it without the user's explicit yes.
+
+1. `kibana-agent feedback preview "<what you ran, what you expected, what you got>"` prints the
+   anonymized report and sends nothing. If it says that the user turned off feedback offers, stop
+   here and do not offer.
+2. Show the report to the user. Tell them that it goes privately to the kibana-agent developer,
+   and ask if you may send it.
+3. Only after a clear yes, run `kibana-agent feedback send` with the same message.
+
+Describe the problem in general terms: no log content, no personal or company data. The command
+removes URLs, hosts, emails, IPs, tokens and the values from your profiles, but it cannot catch
+everything.
+
+If the user says that they do not want these offers, run `kibana-agent feedback offers off`.
+`kibana-agent feedback offers on` turns them on again. With the offers off, still send a report
+when the user asks you to.
+
 ## Profile Space & Index Scoping
 
 Profiles can optionally pin a **Kibana Space** and/or a **default index pattern**:

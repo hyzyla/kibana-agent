@@ -64,6 +64,48 @@ from kibana_agent.client import (
     DryRunResult,
     KibanaAgentError,
 )
+from kibana_agent.feedback import (
+    build_report,
+    offers_enabled,
+    send_report,
+    set_offers_enabled,
+)
+
+FEEDBACK_HINT = (
+    "Something broken, or a result that looks wrong? Offer the user to send anonymous "
+    'feedback: kibana-agent feedback preview "<what you ran, expected, got>". Ask the user '
+    "first, and tell them that the report goes privately to the kibana-agent developer. If "
+    "the user does not want these offers, run: kibana-agent feedback offers off"
+)
+FEEDBACK_PREVIEW_NOTE = (
+    "Nothing was sent. Show this report to the user and tell them that it goes privately "
+    "to the kibana-agent developer. Run 'kibana-agent feedback send' with the same message "
+    "only after the user says yes. If the user does not want these offers, run: "
+    "kibana-agent feedback offers off"
+)
+FEEDBACK_OFFERS_OFF_NOTE = (
+    "Nothing was sent. The user turned off feedback offers, so do not offer to send this "
+    "report. Send it only if the user asked you to report the problem: show them the report, "
+    "then run 'kibana-agent feedback send' with the same message."
+)
+FEEDBACK_AGENT_HELP = """
+## Something broken? Offer to send feedback
+
+When a command fails, a hint is wrong, or a result looks wrong, offer the user
+to report it to the kibana-agent developer:
+
+1. `kibana-agent feedback preview "<what you ran, what you expected, what you got>"`
+   prints the anonymized report and sends nothing.
+2. Show the report to the user. Tell them that it goes privately to the
+   kibana-agent developer, and ask if you may send it.
+3. Only after a clear yes, run `kibana-agent feedback send` with the same message.
+
+Describe the problem in general terms: no log content, no personal or company
+data. The command removes URLs, hosts, emails, IPs, tokens and the values from
+your profiles, but it cannot catch everything.
+
+If the user does not want these offers, run `kibana-agent feedback offers off`.
+"""
 
 
 def emit(data: Any, fmt: str) -> None:
@@ -129,7 +171,15 @@ def _es_kwargs(
     return kwargs
 
 
-@click.group()
+class FeedbackHintGroup(click.Group):
+    """A group that shows the feedback hint under its help, unless the user turned it off."""
+
+    def format_epilog(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
+        if offers_enabled():
+            super().format_epilog(ctx, formatter)
+
+
+@click.group(cls=FeedbackHintGroup, epilog=FEEDBACK_HINT)
 @click.version_option(package_name="kibana-agent")
 def cli() -> None:
     """Read-only Kibana/ES CLI for AI agents."""
@@ -1022,6 +1072,50 @@ def mcp() -> None:
     run()
 
 
+@cli.group()
+def feedback() -> None:
+    """Report a bug or a wrong result to the kibana-agent developer."""
+
+
+@feedback.command("preview")
+@click.argument("message")
+@handle_errors
+def feedback_preview(message: str) -> None:
+    """
+    Print the anonymized report and send nothing.
+
+    Show the report to the user, tell them that it goes privately to the
+    kibana-agent developer, and run "feedback send" only after the user says yes.
+    """
+    emit(build_report(message), "pretty")
+    note = FEEDBACK_PREVIEW_NOTE if offers_enabled() else FEEDBACK_OFFERS_OFF_NOTE
+    click.echo(note, err=True)
+
+
+@feedback.command("send")
+@click.argument("message")
+@handle_errors
+def feedback_send(message: str) -> None:
+    """Send the anonymized report. Only after the user says yes."""
+    send_report(build_report(message))
+    click.echo("Sent to the kibana-agent developer. Thank you.", err=True)
+
+
+@feedback.command("offers")
+@click.argument("state", required=False, type=click.Choice(["on", "off"]))
+def feedback_offers(state: str | None) -> None:
+    """
+    Show or set whether agents offer to send feedback when something breaks.
+
+    Turn it off when the user does not want these offers. The user can still
+    ask an agent to send a report with "feedback send".
+    """
+    if state is not None:
+        set_offers_enabled(state == "on")
+
+    click.echo(f"feedback offers: {'on' if offers_enabled() else 'off'}")
+
+
 @cli.command("agent-help")
 def agent_help() -> None:
     """Print a usage guide for AI agents."""
@@ -1162,8 +1256,9 @@ line prefixed with `#`). Use `--format pretty` for indented JSON.
 
 Profiles store connection details. Manage with `kibana-agent profile`
 subcommands: create, list, show, use, delete, update.
-The active profile is used by default; override with `--profile <name>`.
-""")
+The active profile is used by default; override with `--profile <name>`.""")
+    if offers_enabled():
+        click.echo(FEEDBACK_AGENT_HELP)
 
 
 if __name__ == "__main__":
